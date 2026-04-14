@@ -28,6 +28,12 @@ LEARNINGS_FILE = "compound-engineering.local.md"
 INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MAX_INPUT_HISTORY = 200
 
+# Proactive context budget (in estimated tokens). Thinking modes need more GPU
+# headroom for reasoning tokens, so their budget is tighter.
+CONTEXT_BUDGET_WORK = 100000      # ~100k tokens for work/review/compound/debug
+CONTEXT_BUDGET_THINKING = 60000   # ~60k tokens for plan/brainstorm/ideate (leaves room for reasoning)
+PROACTIVE_TRIM_TARGET = 0.70      # After trimming, target 70% of budget
+
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
@@ -1230,8 +1236,89 @@ def emergency_trim(messages: list) -> list:
     return trimmed
 
 
+def estimate_tokens(messages: list) -> int:
+    """Rough token estimate: ~3.5 chars per token for English/code mix.
+    Includes message overhead (~4 tokens per message for role/formatting)."""
+    total = 0
+    for m in messages:
+        total += 4  # message framing overhead
+        content = m.get("content", "")
+        if content:
+            total += len(content) // 3
+        # Tool calls in assistant messages
+        for tc in m.get("tool_calls", []):
+            fn = tc.get("function", {})
+            total += len(fn.get("name", "")) // 3
+            args = fn.get("arguments", "")
+            if isinstance(args, str):
+                total += len(args) // 3
+            elif isinstance(args, dict):
+                total += len(json.dumps(args)) // 3
+    return total
+
+
+def proactive_trim(messages: list, budget: int) -> list:
+    """Trim messages BEFORE sending to avoid GPU OOM crash.
+
+    Unlike emergency_trim (reactive, after server 400), this runs before
+    each API call to keep context within GPU memory limits. This prevents
+    the Metal OOM crash that kills the oMLX server process.
+    """
+    est = estimate_tokens(messages)
+    if est <= budget:
+        return messages
+
+    _p = tui_print if _tui_instance else print
+    target = int(budget * PROACTIVE_TRIM_TARGET)
+
+    # Find where non-system messages start
+    body_start = 0
+    for i, m in enumerate(messages):
+        if m.get("role") != "system":
+            body_start = i
+            break
+
+    system_msgs = messages[:body_start]
+    body = messages[body_start:]
+
+    # Drop messages from the front of body until under target
+    drop = 0
+    running = estimate_tokens(system_msgs)
+    # Calculate from the end (keep newest) until we hit target
+    keep_from = len(body)
+    for i in range(len(body) - 1, -1, -1):
+        msg_tokens = 4
+        content = body[i].get("content", "")
+        if content:
+            msg_tokens += len(content) // 3
+        for tc in body[i].get("tool_calls", []):
+            fn = tc.get("function", {})
+            msg_tokens += len(fn.get("name", "")) // 3
+            args = fn.get("arguments", "")
+            if isinstance(args, str):
+                msg_tokens += len(args) // 3
+        if running + msg_tokens > target:
+            break
+        running += msg_tokens
+        keep_from = i
+
+    # Always keep at least last 4 messages for coherent conversation
+    keep_from = min(keep_from, max(0, len(body) - 4))
+    drop = keep_from
+
+    if drop <= 0:
+        return messages
+
+    trimmed = system_msgs + body[drop:]
+    new_est = estimate_tokens(trimmed)
+    _p(f"[Proactive trim: {est} -> {new_est} est. tokens, dropped {drop} oldest messages]", C_YELLOW)
+    return trimmed
+
+
 def agent_turn(messages: list, model: str) -> str:
     for round_num in range(MAX_TOOL_ROUNDS):
+        # Proactive trim before API call to prevent GPU OOM
+        messages[:] = proactive_trim(messages, CONTEXT_BUDGET_WORK)
         response = api_call(messages, model)
         if response and response.get("_context_overflow"):
             messages[:] = emergency_trim(messages)
@@ -1410,6 +1497,16 @@ class AgentTUI:
             ("Cancel",       "Cancel current agent operation",           "cancel"),
         ]
 
+        # Todo popup state
+        self.todo_popup_anim_state = "hidden"  # hidden, expanding, shown, collapsing
+        self.todo_popup_anim_height = 0
+        self.todo_popup_target_height = 0
+        self.todo_popup_scroll = 0
+        self.todo_popup_lines = []      # cached wrapped lines for display
+        self.todo_popup_width = 0
+        self.todo_popup_title = ""
+        self._todo_popup_scrollable = False
+
     @property
     def active_model(self) -> str:
         """Return the right model based on current CE mode."""
@@ -1460,6 +1557,52 @@ class AgentTUI:
                         for chunk in chunks:
                             wrapped.append((chunk, color))
         return wrapped
+
+    # ── Todo popup helpers ────────────────────────────────────────────────
+
+    def _get_todo_raw_lines(self) -> list:
+        """Get raw todo list lines."""
+        if not SESSION_TODOS:
+            return ["  No todos in session."]
+        lines = []
+        for i, t in enumerate(SESSION_TODOS):
+            status = "[x]" if t["done"] else "[ ]"
+            lines.append(f"  {i+1}. {status} {t['text']}")
+        return lines
+
+    def _open_todo_popup(self, max_w: int, max_h: int):
+        """Prepare and start opening the todo popup."""
+        raw = self._get_todo_raw_lines()
+        count = len(SESSION_TODOS)
+        self.todo_popup_title = f" Todo List ({count}) " if count else " Todo List "
+
+        # Compute ideal inner width
+        max_line_len = max((len(l) for l in raw), default=0)
+        ideal_inner = max(max_line_len, len(self.todo_popup_title))
+        inner_w = min(ideal_inner, max_w - 4)  # 4 = "| " + " |"
+        inner_w = max(inner_w, 10)  # minimum
+        self.todo_popup_width = inner_w + 4
+
+        # Wrap lines to fit inner width
+        self.todo_popup_lines = []
+        for line in raw:
+            if len(line) <= inner_w:
+                self.todo_popup_lines.append(line)
+            else:
+                chunks = textwrap.wrap(line, inner_w, subsequent_indent="       ",
+                                       break_long_words=True, break_on_hyphens=False)
+                self.todo_popup_lines.extend(chunks if chunks else [line[:inner_w]])
+
+        # Compute target height
+        content_h = len(self.todo_popup_lines)
+        ideal_h = content_h + 2  # +2 for borders
+        self.todo_popup_target_height = min(ideal_h, max_h)
+        self._todo_popup_scrollable = content_h > (self.todo_popup_target_height - 2)
+
+        self.todo_popup_scroll = 0
+        self.todo_popup_anim_state = "expanding"
+        self.todo_popup_anim_height = 1
+        self.needs_redraw = True
 
     # ── Drawing ──────────────────────────────────────────────────────────
 
@@ -1560,14 +1703,14 @@ class AgentTUI:
             round_info = f"R:{getattr(self, 'current_round', 0)}"
             activity = getattr(self, '_activity', '') or 'waiting'
             status = f" {round_info} {activity} "
-            hints = "[Tab: Actions | ^C Cancel]"
+            hints = "[Tab: Actions | ^C Cancel | ^O Todos]"
             bar = f"{status}{hints}"
             color = C_YELLOW
         else:
             mode_tag = f" [{self.active_ce_mode}]" if self.active_ce_mode else ""
             status = f" Ready{mode_tag}  Model: {self.active_model[:40]} "
             nl_hint = "Ret:newline | ^S:submit"
-            hints = f"[{nl_hint} | ^L Clear | ^D Quit | PgUp/Dn Scroll]"
+            hints = f"[{nl_hint} | ^O Todos | ^L Clear | ^D Quit]"
             bar = f"{status}{hints}"
             color = C_GREEN
 
@@ -1610,6 +1753,111 @@ class AgentTUI:
                 self.stdscr.addnstr(menu_y + menu_h - 1, menu_x, bot_border, menu_w, curses.color_pair(C_CYAN))
             except curses.error:
                 pass
+
+        # ── Todo popup (drawn over output pane) ───────────────
+        if self.todo_popup_anim_state != "hidden":
+            anim_h = self.todo_popup_anim_height
+            pw = min(self.todo_popup_width, w)
+            inner_w = pw - 4  # "| " + " |"
+
+            # Animate
+            if self.todo_popup_anim_state == "expanding":
+                step = max(1, self.todo_popup_target_height // 5)
+                self.todo_popup_anim_height = min(anim_h + step, self.todo_popup_target_height)
+                anim_h = self.todo_popup_anim_height
+                if anim_h >= self.todo_popup_target_height:
+                    self.todo_popup_anim_state = "shown"
+                self.needs_redraw = True
+            elif self.todo_popup_anim_state == "collapsing":
+                step = max(1, self.todo_popup_target_height // 5)
+                self.todo_popup_anim_height = max(0, anim_h - step)
+                anim_h = self.todo_popup_anim_height
+                if anim_h <= 0:
+                    self.todo_popup_anim_state = "hidden"
+                    self.needs_redraw = True
+                else:
+                    self.needs_redraw = True
+
+            if anim_h > 0 and self.todo_popup_anim_state != "hidden":
+                popup_bottom = separator_row
+                popup_top = max(0, popup_bottom - anim_h + 1)
+                actual_h = popup_bottom - popup_top + 1
+                content_rows = actual_h - 2  # minus top/bottom border
+
+                # Top border with title
+                title = self.todo_popup_title
+                if len(title) > pw - 2:
+                    title = title[:pw - 2]
+                pad_left = (pw - 2 - len(title)) // 2
+                pad_right = pw - 2 - len(title) - pad_left
+                top_border = "+" + "-" * pad_left + title + "-" * pad_right + "+"
+                try:
+                    self.stdscr.addnstr(popup_top, 0, top_border[:pw], pw, curses.color_pair(C_CYAN))
+                except curses.error:
+                    pass
+
+                # Content rows
+                if content_rows > 0:
+                    total_lines = len(self.todo_popup_lines)
+                    # Clamp scroll
+                    max_scroll = max(0, total_lines - content_rows)
+                    self.todo_popup_scroll = max(0, min(self.todo_popup_scroll, max_scroll))
+                    can_scroll_up = self.todo_popup_scroll > 0
+                    can_scroll_down = (self.todo_popup_scroll + content_rows) < total_lines
+
+                    # Determine arrow indicator space
+                    arrow_str = ""
+                    if can_scroll_up and can_scroll_down:
+                        arrow_str = "^v"
+                    elif can_scroll_up:
+                        arrow_str = "^ "
+                    elif can_scroll_down:
+                        arrow_str = " v"
+
+                    for ci in range(content_rows):
+                        line_idx = self.todo_popup_scroll + ci
+                        screen_row = popup_top + 1 + ci
+                        if screen_row >= popup_bottom:
+                            break
+                        if line_idx < total_lines:
+                            text = self.todo_popup_lines[line_idx]
+                            # Check if this todo is done (for coloring)
+                            is_done = "[x]" in text
+                            color = C_DIM if is_done else C_DEFAULT
+                        else:
+                            text = ""
+                            color = C_DEFAULT
+
+                        # Pad or truncate to inner width
+                        padded = text[:inner_w].ljust(inner_w)
+                        row_str = "| " + padded + " |"
+                        try:
+                            self.stdscr.addnstr(screen_row, 0, row_str[:pw], pw, curses.color_pair(color))
+                            # Draw border chars in cyan
+                            self.stdscr.addnstr(screen_row, 0, "|", 1, curses.color_pair(C_CYAN))
+                            self.stdscr.addnstr(screen_row, pw - 1, "|", 1, curses.color_pair(C_CYAN))
+                        except curses.error:
+                            pass
+
+                # Bottom border with optional scroll arrows
+                arrow_str = ""
+                if self._todo_popup_scrollable and content_rows > 0:
+                    total_lines = len(self.todo_popup_lines)
+                    can_up = self.todo_popup_scroll > 0
+                    can_dn = (self.todo_popup_scroll + content_rows) < total_lines
+                    if can_up and can_dn:
+                        arrow_str = "[^v]"
+                    elif can_up:
+                        arrow_str = "[^ ]"
+                    elif can_dn:
+                        arrow_str = "[ v]"
+
+                bot_fill = pw - 2 - len(arrow_str)
+                bot_border = "+" + "-" * bot_fill + arrow_str + "+"
+                try:
+                    self.stdscr.addnstr(popup_bottom, 0, bot_border[:pw], pw, curses.color_pair(C_CYAN))
+                except curses.error:
+                    pass
 
         # ── Prompt label ─────────────────────────────────────
         if self.active_ce_mode:
@@ -1789,6 +2037,15 @@ class AgentTUI:
                 self.output_lines.clear()
             self.scroll_offset = 0
             return
+        elif key == 15:  # Ctrl+O -- toggle todo popup
+            if self.todo_popup_anim_state in ("shown", "expanding"):
+                self.todo_popup_anim_state = "collapsing"
+            else:
+                h, w = self.stdscr.getmaxyx()
+                # max popup height = output_height area (rough estimate)
+                max_popup_h = max(4, h - 8)
+                self._open_todo_popup(w, max_popup_h)
+            return
 
         # --- Escape: record time for Alt+Enter detection ---
         if key == 27:
@@ -1836,6 +2093,16 @@ class AgentTUI:
         elif key == curses.KEY_END or key == 5:  # Ctrl+E
             self.input_col = len(self.input_lines[self.input_row])
             return
+
+        # --- Up / Down: todo popup scroll takes priority ---
+        if self.todo_popup_anim_state == "shown" and self._todo_popup_scrollable:
+            if key == curses.KEY_UP:
+                self.todo_popup_scroll = max(0, self.todo_popup_scroll - 1)
+                return
+            if key == curses.KEY_DOWN:
+                self.todo_popup_scroll += 1
+                self.needs_redraw = True
+                return
 
         # --- Up / Down: navigate within lines first, then history ---
         if key == curses.KEY_UP:
@@ -2182,6 +2449,9 @@ class AgentTUI:
                     pass
 
                 self._ensure_concurrency()
+                # Proactive trim before API call to prevent GPU OOM
+                budget = CONTEXT_BUDGET_THINKING if self.active_ce_mode in THINKING_MODES else CONTEXT_BUDGET_WORK
+                self.messages = proactive_trim(self.messages, budget)
                 self._activity = "calling API..."
                 self.needs_redraw = True
                 response = api_call(self.messages, self.active_model)
@@ -2327,8 +2597,8 @@ class AgentTUI:
                 except curses.error:
                     # No input available (nodelay mode)
                     time.sleep(0.03)
-                    # Still redraw if agent thread is producing output
-                    if self.agent_running:
+                    # Still redraw if agent thread is producing output or animating
+                    if self.agent_running or self.todo_popup_anim_state in ("expanding", "collapsing"):
                         self.needs_redraw = True
                     continue
 
@@ -2387,9 +2657,10 @@ While Agent is Working:
   Ctrl+C              Cancel current operation
 
 Navigation:
-  Up/Down             Input history
+  Up/Down             Input history (or scroll todos when open)
   Left/Right          Move cursor in input
   Ctrl+A/Ctrl+E       Home/End of input
+  Ctrl+O              Toggle todo list popup
   Ctrl+U/Ctrl+K       Kill line before/after cursor
   PageUp/PageDn       Scroll output
   Ctrl+L              Clear output"""
