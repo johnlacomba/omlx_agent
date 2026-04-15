@@ -28,12 +28,6 @@ LEARNINGS_FILE = "compound-engineering.local.md"
 INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MAX_INPUT_HISTORY = 200
 
-# Proactive context budget (in estimated tokens). Thinking modes need more GPU
-# headroom for reasoning tokens, so their budget is tighter.
-CONTEXT_BUDGET_WORK = 100000      # ~100k tokens for work/review/compound/debug
-CONTEXT_BUDGET_THINKING = 60000   # ~60k tokens for plan/brainstorm/ideate (leaves room for reasoning)
-PROACTIVE_TRIM_TARGET = 0.70      # After trimming, target 70% of budget
-
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
@@ -1236,89 +1230,8 @@ def emergency_trim(messages: list) -> list:
     return trimmed
 
 
-def estimate_tokens(messages: list) -> int:
-    """Rough token estimate: ~3.5 chars per token for English/code mix.
-    Includes message overhead (~4 tokens per message for role/formatting)."""
-    total = 0
-    for m in messages:
-        total += 4  # message framing overhead
-        content = m.get("content", "")
-        if content:
-            total += len(content) // 3
-        # Tool calls in assistant messages
-        for tc in m.get("tool_calls", []):
-            fn = tc.get("function", {})
-            total += len(fn.get("name", "")) // 3
-            args = fn.get("arguments", "")
-            if isinstance(args, str):
-                total += len(args) // 3
-            elif isinstance(args, dict):
-                total += len(json.dumps(args)) // 3
-    return total
-
-
-def proactive_trim(messages: list, budget: int) -> list:
-    """Trim messages BEFORE sending to avoid GPU OOM crash.
-
-    Unlike emergency_trim (reactive, after server 400), this runs before
-    each API call to keep context within GPU memory limits. This prevents
-    the Metal OOM crash that kills the oMLX server process.
-    """
-    est = estimate_tokens(messages)
-    if est <= budget:
-        return messages
-
-    _p = tui_print if _tui_instance else print
-    target = int(budget * PROACTIVE_TRIM_TARGET)
-
-    # Find where non-system messages start
-    body_start = 0
-    for i, m in enumerate(messages):
-        if m.get("role") != "system":
-            body_start = i
-            break
-
-    system_msgs = messages[:body_start]
-    body = messages[body_start:]
-
-    # Drop messages from the front of body until under target
-    drop = 0
-    running = estimate_tokens(system_msgs)
-    # Calculate from the end (keep newest) until we hit target
-    keep_from = len(body)
-    for i in range(len(body) - 1, -1, -1):
-        msg_tokens = 4
-        content = body[i].get("content", "")
-        if content:
-            msg_tokens += len(content) // 3
-        for tc in body[i].get("tool_calls", []):
-            fn = tc.get("function", {})
-            msg_tokens += len(fn.get("name", "")) // 3
-            args = fn.get("arguments", "")
-            if isinstance(args, str):
-                msg_tokens += len(args) // 3
-        if running + msg_tokens > target:
-            break
-        running += msg_tokens
-        keep_from = i
-
-    # Always keep at least last 4 messages for coherent conversation
-    keep_from = min(keep_from, max(0, len(body) - 4))
-    drop = keep_from
-
-    if drop <= 0:
-        return messages
-
-    trimmed = system_msgs + body[drop:]
-    new_est = estimate_tokens(trimmed)
-    _p(f"[Proactive trim: {est} -> {new_est} est. tokens, dropped {drop} oldest messages]", C_YELLOW)
-    return trimmed
-
-
 def agent_turn(messages: list, model: str) -> str:
     for round_num in range(MAX_TOOL_ROUNDS):
-        # Proactive trim before API call to prevent GPU OOM
-        messages[:] = proactive_trim(messages, CONTEXT_BUDGET_WORK)
         response = api_call(messages, model)
         if response and response.get("_context_overflow"):
             messages[:] = emergency_trim(messages)
@@ -2449,9 +2362,6 @@ class AgentTUI:
                     pass
 
                 self._ensure_concurrency()
-                # Proactive trim before API call to prevent GPU OOM
-                budget = CONTEXT_BUDGET_THINKING if self.active_ce_mode in THINKING_MODES else CONTEXT_BUDGET_WORK
-                self.messages = proactive_trim(self.messages, budget)
                 self._activity = "calling API..."
                 self.needs_redraw = True
                 response = api_call(self.messages, self.active_model)
