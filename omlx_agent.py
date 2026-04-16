@@ -219,12 +219,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "ce_manage_todos",
-            "description": "Manage a todo list for the current work session. Actions: list, add, complete, remove.",
+            "description": "Manage a todo list for the current work session. Use this for ALL multi-step tasks. Actions: list, add, complete, clear. NEVER remove individual items -- mark them complete instead. Only use clear when starting an entirely new task.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "One of: list, add, complete, remove"},
-                    "item": {"type": "string", "description": "Todo text (for add) or index number (for complete/remove)"},
+                    "action": {"type": "string", "description": "One of: list, add, complete, clear. Use 'complete' to mark items done (keeps them visible). Use 'clear' ONLY when starting a fresh task."},
+                    "item": {"type": "string", "description": "Todo text (for add) or index number (for complete)"},
                 },
                 "required": ["action"],
             },
@@ -541,17 +541,12 @@ def tool_ce_manage_todos(action: str, item: str = None) -> str:
             return "ERROR: invalid index"
         except ValueError:
             return "ERROR: item must be a number"
+    elif action == "clear":
+        count = len(SESSION_TODOS)
+        SESSION_TODOS.clear()
+        return f"Cleared {count} todos. Ready for a fresh task."
     elif action == "remove":
-        if not item:
-            return "ERROR: item index required"
-        try:
-            idx = int(item) - 1
-            if 0 <= idx < len(SESSION_TODOS):
-                removed = SESSION_TODOS.pop(idx)
-                return f"Removed: {removed['text']}"
-            return "ERROR: invalid index"
-        except ValueError:
-            return "ERROR: item must be a number"
+        return "ERROR: Use 'complete' to mark items done instead of removing them. Completed items serve as a progress record. Use 'clear' only when starting an entirely new task."
     return f"ERROR: unknown action '{action}'"
 
 
@@ -859,15 +854,15 @@ Workflow:
 1. Use ce_list_docs(doc_type="plans") to find the plan, then read it
 2. Read ce_read_learnings for relevant gotchas before starting work
 3. Check which steps are already marked [x] (completed) -- resume from the first unchecked [ ] step
-3. Create a todo list from the REMAINING unchecked steps (ce_manage_todos)
+3. Create a todo list from the REMAINING unchecked steps (ce_manage_todos). This is MANDATORY -- never skip this step.
 4. Work through each todo:
-   a. Mark it in-progress
-   b. Gather context (read files, search)
-   c. Make the change
-   d. Verify (run tests, check errors)
-   e. Mark complete in the session todos
-   f. IMMEDIATELY mark the step done in the plan file using ce_mark_step
-5. After all todos done, show summary of changes
+   a. Gather context (read files, search)
+   b. Make the change
+   c. Verify (run tests, check errors)
+   d. Mark complete in the session todos using ce_manage_todos(action='complete')
+   e. IMMEDIATELY mark the step done in the plan file using ce_mark_step
+   f. NEVER remove completed todos -- they serve as a visible progress record
+5. After all todos done, list the final todo state to show completion, then summarize changes
 
 RESUMABILITY: Always use ce_mark_step to check off completed steps in the plan file as you finish each one. This way, if the session is interrupted, the next /ce:work invocation will see which steps are already done and resume from where you left off.
 
@@ -1110,6 +1105,12 @@ Guidelines:
 - Check ce_read_learnings at the start of non-trivial tasks
 - Be concise. Act first, explain briefly.
 - NEVER stop mid-work. Finish what you start.
+
+Todo List Management:
+- For ANY multi-step task, create a todo list using ce_manage_todos BEFORE starting work.
+- Mark each todo complete as you finish it. NEVER remove completed items -- they serve as a progress record.
+- Only use the "clear" action when starting an entirely new task that needs a fresh list.
+- Check the todo list frequently to stay on track and show progress.
 
 Working directory: {work_dir}"""
 
@@ -1476,7 +1477,7 @@ class AgentTUI:
     def _get_todo_raw_lines(self) -> list:
         """Get raw todo list lines."""
         if not SESSION_TODOS:
-            return ["  No todos in session."]
+            return ["  N/A"]
         lines = []
         for i, t in enumerate(SESSION_TODOS):
             status = "[x]" if t["done"] else "[ ]"
@@ -2484,12 +2485,19 @@ class AgentTUI:
         stdscr.nodelay(True)
         stdscr.keypad(True)
         curses.curs_set(1)
-        # Disable XON/XOFF flow control so Ctrl+S reaches the app
+        # Disable terminal driver interception of Ctrl+S and Ctrl+O
         import tty, termios
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         new_attrs = termios.tcgetattr(fd)
-        new_attrs[0] &= ~termios.IXON  # iflag: disable XON/XOFF
+        new_attrs[0] &= ~termios.IXON  # iflag: disable XON/XOFF (frees Ctrl+S)
+        # Disable VDISCARD (Ctrl+O) -- macOS terminal eats it as "discard output"
+        try:
+            new_attrs[3] &= ~termios.FLUSHO  # lflag: clear any active flush
+            vdiscard_idx = termios.VDISCARD
+            new_attrs[6][vdiscard_idx] = 0  # cc: disable VDISCARD char
+        except (AttributeError, IndexError):
+            pass  # not all platforms define VDISCARD
         termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
 
         self.add_output("oMLX Coding Agent + Compound Engineering", C_GREEN)
