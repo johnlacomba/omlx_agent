@@ -1007,17 +1007,6 @@ Guidelines:
 Workflow:
 1. Review what was just done (git_log, git_diff)
 2. Read ce_read_learnings to check for existing entries -- avoid duplicating what's already documented
-
-Solution Context (run BEFORE documenting):
-If .temp_relevantSolutions exists, read it and load the listed solution files as reference, then skip to step 3.
-Otherwise, if docs/solutions/ or referenceDocs/solutions/ exists, run this pipeline:
-  a. Call ce_scan_solution_headers() with no args to get the solutions directory tree. Write one repo-relative file path per line to .temp_solutionDirs.
-  b. For subdirectories whose names look relevant to the recent changes (check git_log), call ce_scan_solution_headers(directory=<subdir>) to get headers. Extract tags and write each as "path: tag1, tag2" to .temp_tagList.
-  c. Select tags relevant to the recent changes. Write selected tags (one per line) to .temp_relevantTags.
-  d. Find solution files matching any selected tag. Write matching paths to .temp_relevantSolutions.
-  e. Read the matched solution files as reference to avoid duplicating existing documentation.
-If no solutions directory exists, skip the pipeline entirely.
-
 3. Check for any review docs with ce_list_docs(doc_type="reviews") -- if a review doc exists, read it and work through its findings
 4. Identify learnings:
    - What problem was solved?
