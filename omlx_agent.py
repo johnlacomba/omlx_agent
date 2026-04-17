@@ -644,6 +644,11 @@ def tool_ce_save_doc(doc_type: str, content: str, name: str = None) -> str:
     with open(path, "w") as f:
         f.write(content)
     rel = os.path.relpath(path, WORK_DIR)
+
+    # R4: Update temp file indexes when a solution is saved
+    if doc_type == "solution":
+        _update_temp_indexes(rel, content)
+
     return f"{doc_type.capitalize()} saved: {rel}"
 
 
@@ -771,6 +776,66 @@ def _read_head(filepath: str, n: int = 20) -> str:
         return f"(error reading: {e})"
 
 
+_TEMP_FILES = [
+    ".temp_solutionDirs",
+    ".temp_tagList",
+    ".temp_relevantTags",
+    ".temp_relevantSolutions",
+]
+
+
+def _rotate_temp_files():
+    """Rotate .temp_* session files to .old on startup, preserving prior session data."""
+    for name in _TEMP_FILES:
+        src = os.path.join(WORK_DIR, name)
+        if os.path.exists(src):
+            dst = src + ".old"
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass  # best-effort; don't block startup
+
+
+def _extract_tags(content: str) -> list:
+    """Extract tags from the first 20 lines of solution content.
+    Supports YAML frontmatter (tags:\\n  - tag) and markdown bold (**tags:** t1, t2)."""
+    lines = content.split("\n", 20)[:20]
+    tags = []
+    in_yaml_tags = False
+    for line in lines:
+        stripped = line.strip()
+        if in_yaml_tags:
+            if stripped.startswith("- "):
+                tags.append(stripped[2:].strip())
+                continue
+            else:
+                in_yaml_tags = False
+        if stripped.lower() == "tags:":
+            in_yaml_tags = True
+            continue
+        if stripped.lower().startswith("**tags:**"):
+            raw = stripped[len("**tags:**"):].strip()
+            tags.extend(t.strip() for t in raw.split(",") if t.strip())
+    return tags
+
+
+def _update_temp_indexes(rel_path: str, content: str):
+    """Append a new solution's info to .temp_solutionDirs and .temp_tagList if they exist."""
+    dirs_file = os.path.join(WORK_DIR, ".temp_solutionDirs")
+    tags_file = os.path.join(WORK_DIR, ".temp_tagList")
+    try:
+        if os.path.exists(dirs_file):
+            with open(dirs_file, "a") as f:
+                f.write(rel_path + "\n")
+        if os.path.exists(tags_file):
+            tags = _extract_tags(content)
+            tag_str = ", ".join(tags) if tags else ""
+            with open(tags_file, "a") as f:
+                f.write(f"{rel_path}: {tag_str}\n")
+    except OSError:
+        pass  # best-effort; don't fail the save
+
+
 TOOL_DISPATCH = {
     "run_command": lambda args: tool_run_command(args["command"]),
     "read_file": lambda args: tool_read_file(args["path"], args.get("line_start"), args.get("line_end")),
@@ -824,6 +889,17 @@ Workflow:
 1. Use ce_list_docs to check for existing plans and brainstorms
 2. Read ce_read_learnings for relevant past solutions and known patterns
 3. Read any existing brainstorm/requirements context
+
+Solution Context (run BEFORE main work):
+If .temp_relevantSolutions exists, read it and load the listed solution files as reference, then skip to step 4.
+Otherwise, if docs/solutions/ or referenceDocs/solutions/ exists, run this pipeline:
+  a. Call ce_scan_solution_headers() with no args to get the solutions directory tree. Write one repo-relative file path per line to .temp_solutionDirs.
+  b. For subdirectories whose names look relevant to the brainstorm's problem statement, call ce_scan_solution_headers(directory=<subdir>) to get headers. Extract tags and write each as "path: tag1, tag2" to .temp_tagList.
+  c. Select tags relevant to the brainstorm's problem statement. Write selected tags (one per line) to .temp_relevantTags.
+  d. Find solution files matching any selected tag. Write matching paths to .temp_relevantSolutions.
+  e. Read the matched solution files as reference material.
+If no solutions directory exists, skip the pipeline entirely.
+
 3. Break the work into ordered, concrete steps
 4. Identify risks and dependencies
 5. Estimate relative complexity per step
@@ -859,6 +935,17 @@ Guidelines:
 Workflow:
 1. Use ce_list_docs(doc_type="plans") to find the plan, then read it
 2. Read ce_read_learnings for relevant gotchas before starting work
+
+Solution Context (run BEFORE main work):
+If .temp_relevantSolutions exists, read it and load the listed solution files as reference, then skip to step 3.
+Otherwise, if docs/solutions/ or referenceDocs/solutions/ exists, run this pipeline:
+  a. Call ce_scan_solution_headers() with no args to get the solutions directory tree. Write one repo-relative file path per line to .temp_solutionDirs.
+  b. For subdirectories whose names look relevant to the plan's goal and current step, call ce_scan_solution_headers(directory=<subdir>) to get headers. Extract tags and write each as "path: tag1, tag2" to .temp_tagList.
+  c. Select tags relevant to the plan's goal and current step. Write selected tags (one per line) to .temp_relevantTags.
+  d. Find solution files matching any selected tag. Write matching paths to .temp_relevantSolutions.
+  e. Read the matched solution files as reference material.
+If no solutions directory exists, skip the pipeline entirely.
+
 3. Check which steps are already marked [x] (completed) -- resume from the first unchecked [ ] step
 3. Create a todo list from the REMAINING unchecked steps (ce_manage_todos). This is MANDATORY -- never skip this step.
 4. Work through each todo:
@@ -884,6 +971,17 @@ Guidelines:
 
 Workflow:
 1. Read ce_read_learnings for known patterns and gotchas to check against
+
+Solution Context (run BEFORE the review):
+If .temp_relevantSolutions exists, read it and load the listed solution files as reference, then skip to step 2.
+Otherwise, if docs/solutions/ or referenceDocs/solutions/ exists, run this pipeline:
+  a. Call ce_scan_solution_headers() with no args to get the solutions directory tree. Write one repo-relative file path per line to .temp_solutionDirs.
+  b. For subdirectories whose names look relevant to the diff's changed files and topics, call ce_scan_solution_headers(directory=<subdir>) to get headers. Extract tags and write each as "path: tag1, tag2" to .temp_tagList.
+  c. Select tags relevant to the diff's changed file paths and topics. Write selected tags (one per line) to .temp_relevantTags.
+  d. Find solution files matching any selected tag. Write matching paths to .temp_relevantSolutions.
+  e. Read the matched solution files as reference material.
+If no solutions directory exists, skip the pipeline entirely.
+
 2. Get the diff: use git_diff to see all changes
 3. Review from multiple perspectives:
    - **Correctness**: Logic errors, edge cases, state bugs
@@ -909,6 +1007,17 @@ Guidelines:
 Workflow:
 1. Review what was just done (git_log, git_diff)
 2. Read ce_read_learnings to check for existing entries -- avoid duplicating what's already documented
+
+Solution Context (run BEFORE documenting):
+If .temp_relevantSolutions exists, read it and load the listed solution files as reference, then skip to step 3.
+Otherwise, if docs/solutions/ or referenceDocs/solutions/ exists, run this pipeline:
+  a. Call ce_scan_solution_headers() with no args to get the solutions directory tree. Write one repo-relative file path per line to .temp_solutionDirs.
+  b. For subdirectories whose names look relevant to the recent changes (check git_log), call ce_scan_solution_headers(directory=<subdir>) to get headers. Extract tags and write each as "path: tag1, tag2" to .temp_tagList.
+  c. Select tags relevant to the recent changes. Write selected tags (one per line) to .temp_relevantTags.
+  d. Find solution files matching any selected tag. Write matching paths to .temp_relevantSolutions.
+  e. Read the matched solution files as reference to avoid duplicating existing documentation.
+If no solutions directory exists, skip the pipeline entirely.
+
 3. Check for any review docs with ce_list_docs(doc_type="reviews") -- if a review doc exists, read it and work through its findings
 4. Identify learnings:
    - What problem was solved?
@@ -1105,6 +1214,7 @@ CE documents are stored in docs/ or referenceDocs/ subdirectories (brainstorms/,
 
 Guidelines:
 - Use tools to gather context before making changes
+- NEVER guess or fabricate file paths. When you need a file whose path you do not already know, use list_directory first to discover what exists. Only then use read_file or search_files on confirmed paths.
 - Use replace_in_file for surgical edits; write_file for new files
 - After making changes, verify with read_file or run_command
 - Use git_commit_and_push when asked to commit/push/sync
@@ -2946,6 +3056,7 @@ def main():
     args = parser.parse_args()
 
     set_work_dir(args.repo)
+    _rotate_temp_files()
 
     # Fetch models before entering curses
     models = fetch_models()
