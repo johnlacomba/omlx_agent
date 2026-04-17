@@ -17,6 +17,7 @@ exec /Users/jlacomba/omlx-venv/bin/omlx serve \
     --max-model-memory 32GB \
     --max-process-memory 85% \
     --hot-cache-max-size 8GB \
-    --initial-cache-blocks 128 \
+    --initial-cache-blocks 64 \
     --paged-ssd-cache-max-size 200GB \
+    --max-concurrent-requests 1 \
     --log-level info

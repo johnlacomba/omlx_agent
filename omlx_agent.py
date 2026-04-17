@@ -21,7 +21,7 @@ from datetime import datetime
 
 API_URL = "http://localhost:8000/v1"
 API_KEY = os.environ.get("OMLX_API_KEY", "omlx-80ktncu2cdui9fal")
-MAX_TOKENS = 131072  # Match oMLX server limit; model stops naturally via finish_reason:stop
+MAX_TOKENS = 49152  # Cap output tokens to prevent KV cache OOM on 48GB systems
 MAX_TOOL_ROUNDS = 40
 EMERGENCY_TRIM_DROP = 20  # Messages to drop when oMLX returns "Prompt too long"
 LEARNINGS_FILE = "compound-engineering.local.md"
@@ -529,6 +529,8 @@ def tool_ce_manage_todos(action: str, item: str = None) -> str:
         if not item:
             return "ERROR: item is required for add"
         SESSION_TODOS.append({"text": item, "done": False})
+        if _tui_instance:
+            _tui_instance.needs_redraw = True
         return f"Added todo #{len(SESSION_TODOS)}: {item}"
     elif action == "complete":
         if not item:
@@ -537,6 +539,8 @@ def tool_ce_manage_todos(action: str, item: str = None) -> str:
             idx = int(item) - 1
             if 0 <= idx < len(SESSION_TODOS):
                 SESSION_TODOS[idx]["done"] = True
+                if _tui_instance:
+                    _tui_instance.needs_redraw = True
                 return f"Completed: {SESSION_TODOS[idx]['text']}"
             return "ERROR: invalid index"
         except ValueError:
@@ -544,6 +548,8 @@ def tool_ce_manage_todos(action: str, item: str = None) -> str:
     elif action == "clear":
         count = len(SESSION_TODOS)
         SESSION_TODOS.clear()
+        if _tui_instance:
+            _tui_instance.needs_redraw = True
         return f"Cleared {count} todos. Ready for a fresh task."
     elif action == "remove":
         return "ERROR: Use 'complete' to mark items done instead of removing them. Completed items serve as a progress record. Use 'clear' only when starting an entirely new task."
@@ -1421,6 +1427,164 @@ class AgentTUI:
         self.todo_popup_title = ""
         self._todo_popup_scrollable = False
 
+        # Memory monitor state
+        self._mem_lock = threading.Lock()
+        self._mem_sys_total = 0       # total system RAM bytes
+        self._mem_sys_used = 0        # used system RAM bytes
+        self._mem_sys_free = 0        # free + inactive system RAM bytes
+        self._mem_pressure = ""       # macOS memory pressure level
+        self._mem_model_used = 0      # oMLX model memory used bytes
+        self._mem_model_max = 0       # oMLX model memory max bytes
+        self._mem_ctx_msgs = 0        # current conversation message count
+        self._mem_active_reqs = 0     # active inference requests
+        self._mem_cache_eff = 0.0     # KV cache efficiency %
+        self._mem_total_tokens = 0    # total tokens this session
+        self._mem_hot_cache_used = 0  # hot cache used bytes
+        self._mem_hot_cache_max = 0   # hot cache max bytes
+        self._mem_hot_cache_entries = 0  # hot cache entry count
+        self._mem_poll_thread = None
+        self._mem_poll_stop = threading.Event()
+
+    def _start_memory_monitor(self):
+        """Start background thread that polls system and oMLX memory stats."""
+        def poll_loop():
+            while not self._mem_poll_stop.is_set():
+                try:
+                    self._poll_memory()
+                except Exception:
+                    pass
+                self._mem_poll_stop.wait(3)  # poll every 3 seconds
+        self._mem_poll_thread = threading.Thread(target=poll_loop, daemon=True)
+        self._mem_poll_thread.start()
+
+    def _stop_memory_monitor(self):
+        """Stop the memory polling thread."""
+        self._mem_poll_stop.set()
+        if self._mem_poll_thread:
+            self._mem_poll_thread.join(timeout=2)
+
+    def _poll_memory(self):
+        """Poll system memory and oMLX server stats."""
+        # System memory via vm_stat (available on all macOS)
+        try:
+            result = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=3
+            )
+            page_size = 16384  # default Apple Silicon
+            ps_match = re.search(r'page size of (\d+) bytes', result.stdout)
+            if ps_match:
+                page_size = int(ps_match.group(1))
+
+            stats = {}
+            for line in result.stdout.strip().split('\n'):
+                m = re.match(r'^(.+?):\s+(\d+)', line)
+                if m:
+                    stats[m.group(1).strip()] = int(m.group(2))
+
+            free_pages = stats.get('Pages free', 0)
+            active_pages = stats.get('Pages active', 0)
+            inactive_pages = stats.get('Pages inactive', 0)
+            wired_pages = stats.get('Pages wired down', 0)
+            speculative_pages = stats.get('Pages speculative', 0)
+            # Compressor pages count as used
+            compressor_pages = stats.get('Pages occupied by compressor', 0)
+            purgeable_pages = stats.get('Pages purgeable', 0)
+
+            total_used_pages = active_pages + wired_pages + compressor_pages
+            total_free_pages = free_pages + inactive_pages + speculative_pages + purgeable_pages
+
+            # Get total from sysctl
+            try:
+                sysctl_result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=3
+                )
+                total_bytes = int(sysctl_result.stdout.strip())
+            except Exception:
+                total_bytes = (total_used_pages + total_free_pages) * page_size
+
+            with self._mem_lock:
+                self._mem_sys_total = total_bytes
+                self._mem_sys_used = total_used_pages * page_size
+                self._mem_sys_free = total_free_pages * page_size
+        except Exception:
+            pass
+
+        # macOS memory pressure
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                capture_output=True, text=True, timeout=3
+            )
+            level = int(result.stdout.strip())
+            pressure_map = {1: "normal", 2: "warn", 4: "critical"}
+            with self._mem_lock:
+                self._mem_pressure = pressure_map.get(level, f"L{level}")
+        except Exception:
+            with self._mem_lock:
+                self._mem_pressure = "?"
+
+        # oMLX server stats
+        try:
+            req = urllib.request.Request(
+                f"{API_URL.replace('/v1', '')}/api/status",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            with self._mem_lock:
+                self._mem_model_used = data.get("model_memory_used", 0) or 0
+                self._mem_model_max = data.get("model_memory_max", 0) or 0
+                self._mem_active_reqs = data.get("active_requests", 0)
+                self._mem_cache_eff = data.get("cache_efficiency", 0.0) or 0.0
+                self._mem_total_tokens = (
+                    (data.get("total_prompt_tokens", 0) or 0)
+                    + (data.get("total_completion_tokens", 0) or 0)
+                )
+        except Exception:
+            pass
+
+        # Hot cache stats via admin API
+        try:
+            cookie = _omlx_admin_login()
+            if cookie:
+                req = urllib.request.Request(
+                    f"{API_URL.replace('/v1', '')}/admin/api/stats",
+                    headers={"Cookie": f"omlx_admin_session={cookie}"},
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    stats_data = json.loads(resp.read())
+                rc = stats_data.get("runtime_cache", {})
+                models = rc.get("models", [])
+                # Aggregate hot cache across all loaded models
+                hc_used = 0
+                hc_max = 0
+                hc_entries = 0
+                for m in models:
+                    hc_used += int(m.get("hot_cache_size_bytes", 0) or 0)
+                    hc_max += int(m.get("hot_cache_max_bytes", 0) or 0)
+                    hc_entries += int(m.get("hot_cache_entries", 0) or 0)
+                with self._mem_lock:
+                    self._mem_hot_cache_used = hc_used
+                    self._mem_hot_cache_max = hc_max
+                    self._mem_hot_cache_entries = hc_entries
+        except Exception:
+            pass
+
+        # Context message count
+        with self._mem_lock:
+            self._mem_ctx_msgs = len(self.messages)
+
+        self.needs_redraw = True
+
+    def _format_bytes(self, b: int) -> str:
+        """Format bytes to human-readable string."""
+        if b <= 0:
+            return "0B"
+        if b < 1024 ** 3:
+            return f"{b / (1024**2):.0f}MB"
+        return f"{b / (1024**3):.1f}GB"
+
     @property
     def active_model(self) -> str:
         """Return the right model based on current CE mode."""
@@ -1518,6 +1682,30 @@ class AgentTUI:
         self.todo_popup_anim_height = 1
         self.needs_redraw = True
 
+    def _refresh_todo_popup_content(self):
+        """Refresh cached todo popup lines from SESSION_TODOS without restarting animation."""
+        if self.todo_popup_anim_state not in ("shown", "expanding"):
+            return
+        raw = self._get_todo_raw_lines()
+        count = len(SESSION_TODOS)
+        self.todo_popup_title = f" Todo List ({count}) " if count else " Todo List "
+
+        inner_w = self.todo_popup_width - 4
+        if inner_w < 1:
+            return
+
+        self.todo_popup_lines = []
+        for line in raw:
+            if len(line) <= inner_w:
+                self.todo_popup_lines.append(line)
+            else:
+                chunks = textwrap.wrap(line, inner_w, subsequent_indent="       ",
+                                       break_long_words=True, break_on_hyphens=False)
+                self.todo_popup_lines.extend(chunks if chunks else [line[:inner_w]])
+
+        content_h = len(self.todo_popup_lines)
+        self._todo_popup_scrollable = content_h > (self.todo_popup_target_height - 2)
+
     # ── Drawing ──────────────────────────────────────────────────────────
 
     def draw(self):
@@ -1571,13 +1759,15 @@ class AgentTUI:
         # Layout from bottom up:
         #   h-1 .. h-input_rows : input lines
         #   h-input_rows-1      : prompt label
-        #   h-input_rows-2      : status bar
-        #   h-input_rows-3      : separator
-        #   0 .. h-input_rows-4 : output
+        #   h-input_rows-2      : status bar (commands/hints)
+        #   h-input_rows-3      : memory bar (system + model memory)
+        #   h-input_rows-4      : separator
+        #   0 .. h-input_rows-5 : output
         input_start_row = h - input_rows
         prompt_row = input_start_row - 1
         status_row = prompt_row - 1
-        separator_row = status_row - 1
+        memory_row = status_row - 1
+        separator_row = memory_row - 1
         output_height = separator_row
 
         self.stdscr.erase()
@@ -1634,6 +1824,96 @@ class AgentTUI:
         except curses.error:
             pass
 
+        # ── Memory bar (below separator, above status bar) ───
+        with self._mem_lock:
+            sys_total = self._mem_sys_total
+            sys_used = self._mem_sys_used
+            sys_free = self._mem_sys_free
+            pressure = self._mem_pressure
+            model_used = self._mem_model_used
+            model_max = self._mem_model_max
+            ctx_msgs = self._mem_ctx_msgs
+            active_reqs = self._mem_active_reqs
+            cache_eff = self._mem_cache_eff
+            total_tokens = self._mem_total_tokens
+            hc_used = self._mem_hot_cache_used
+            hc_max = self._mem_hot_cache_max
+            hc_entries = self._mem_hot_cache_entries
+
+        if sys_total > 0:
+            pct_used = (sys_used / sys_total) * 100
+            sys_part = f"RAM: {self._format_bytes(sys_used)}/{self._format_bytes(sys_total)} ({pct_used:.0f}%)"
+        else:
+            sys_part = "RAM: --"
+            pct_used = 0
+
+        # Memory pressure indicator with color
+        if pressure == "critical":
+            mem_color = C_RED
+            pressure_tag = " CRITICAL"
+        elif pressure == "warn":
+            mem_color = C_YELLOW
+            pressure_tag = " WARN"
+        elif pressure == "normal":
+            mem_color = C_GREEN
+            pressure_tag = ""
+        else:
+            mem_color = C_DIM
+            pressure_tag = ""
+
+        # Model memory
+        if model_max > 0:
+            model_pct = (model_used / model_max) * 100
+            model_part = f"Model: {self._format_bytes(model_used)}/{self._format_bytes(model_max)} ({model_pct:.0f}%)"
+        elif model_used > 0:
+            model_part = f"Model: {self._format_bytes(model_used)}"
+        else:
+            model_part = ""
+
+        # Hot cache
+        if hc_max > 0:
+            hc_pct = (hc_used / hc_max) * 100
+            hot_part = f"Hot$: {self._format_bytes(hc_used)}/{self._format_bytes(hc_max)} ({hc_pct:.0f}%)"
+        elif hc_used > 0:
+            hot_part = f"Hot$: {self._format_bytes(hc_used)}"
+        else:
+            hot_part = ""
+
+        # Context info
+        ctx_part = f"Msgs: {ctx_msgs}"
+        if total_tokens > 0:
+            if total_tokens >= 1000000:
+                tok_str = f"{total_tokens/1000000:.1f}M"
+            elif total_tokens >= 1000:
+                tok_str = f"{total_tokens/1000:.0f}K"
+            else:
+                tok_str = str(total_tokens)
+            ctx_part += f"  Tok: {tok_str}"
+        if cache_eff > 0:
+            ctx_part += f"  Cache: {cache_eff:.0f}%"
+
+        mem_bar_parts = [f" {sys_part}{pressure_tag}"]
+        if model_part:
+            mem_bar_parts.append(model_part)
+        if hot_part:
+            mem_bar_parts.append(hot_part)
+        mem_bar_parts.append(ctx_part)
+        mem_bar = "  |  ".join(mem_bar_parts) + " "
+
+        # Color based on overall RAM pressure
+        if pct_used >= 90 or pressure == "critical":
+            bar_color = C_RED
+        elif pct_used >= 75 or pressure == "warn":
+            bar_color = C_YELLOW
+        else:
+            bar_color = C_DIM
+
+        try:
+            mem_padded = mem_bar.ljust(w - 1)[:w - 1]
+            self.stdscr.addnstr(memory_row, 0, mem_padded, w - 1, curses.color_pair(bar_color))
+        except curses.error:
+            pass
+
         # ── Action menu popup (over output area, above status bar) ────
         if self.menu_open and self.agent_running:
             menu_w = 50
@@ -1670,6 +1950,8 @@ class AgentTUI:
 
         # ── Todo popup (drawn over output pane) ───────────────
         if self.todo_popup_anim_state != "hidden":
+            # Refresh content live so completed items update without reopening
+            self._refresh_todo_popup_content()
             anim_h = self.todo_popup_anim_height
             pw = min(self.todo_popup_width, w)
             inner_w = pw - 4  # "| " + " |"
@@ -2507,6 +2789,9 @@ class AgentTUI:
         self.add_output("Type /help for commands. Start typing to chat.", C_DIM)
         self.add_output("-" * 60, C_DIM)
 
+        # Start memory monitoring background thread
+        self._start_memory_monitor()
+
         try:
             while not self.quit_flag:
                 self.draw()
@@ -2544,6 +2829,8 @@ class AgentTUI:
 
                 self.handle_key(key_int)
         finally:
+            # Stop memory monitor
+            self._stop_memory_monitor()
             # Restore original terminal attributes (re-enable flow control)
             termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
 
