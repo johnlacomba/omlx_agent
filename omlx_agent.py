@@ -2819,8 +2819,20 @@ class AgentTUI:
                     self.messages.append({"role": "user", "content": "[System: Your response was truncated because it hit the generation token limit. Continue EXACTLY where you left off. Do NOT repeat what you already said. If you were about to make a tool call, make it now.]"})
                     continue
 
-                # Final text response
+                # Final text response -- but check if the model is narrating instead of acting
                 self.messages.append({"role": "assistant", "content": text})
+                if (self.active_ce_mode and round_num < MAX_TOOL_ROUNDS - 1
+                        and text and len(text.strip()) < 300
+                        and any(kw in text.lower() for kw in
+                                ["let me", "i need to", "i'll ", "i will", "i should",
+                                 "next step", "now i", "let's "])):
+                    _ts = datetime.now().strftime("%H:%M:%S")
+                    tui_print(f"[{_ts}] [auto-nudge: model narrated instead of acting]", C_DIM)
+                    self.messages.append({
+                        "role": "user",
+                        "content": "[System: Do not narrate what you plan to do. Use your tools to do it NOW. Make the tool call.]"
+                    })
+                    continue
                 return text
 
             # Max rounds hit -- auto-continue instead of stopping
