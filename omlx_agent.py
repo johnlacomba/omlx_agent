@@ -1366,7 +1366,7 @@ def agent_turn(messages: list, model: str) -> str:
             _ts = datetime.now().strftime("%H:%M:%S")
             _p(f"[{_ts}] [thinking] {display}", C_DIM)
 
-        if choice["finish_reason"] == "tool_calls" and msg.get("tool_calls"):
+        if msg.get("tool_calls"):
             messages.append({
                 "role": "assistant",
                 "content": msg.get("content") or "",
@@ -1385,7 +1385,7 @@ def agent_turn(messages: list, model: str) -> str:
             continue
 
         # Fallback: parse <tool_call> tags from text content
-        text = msg.get("content", "")
+        text = msg.get("content") or ""
         text_calls = parse_text_tool_calls(text)
         if text_calls:
             # Strip tool_call/tool_use tags from displayed text
@@ -2784,7 +2784,7 @@ class AgentTUI:
                     tui_print(f"[{_ts}] [thinking] {display}", C_DIM)
 
                 # Structured tool calls
-                if choice["finish_reason"] == "tool_calls" and msg.get("tool_calls"):
+                if msg.get("tool_calls"):
                     self.messages.append({
                         "role": "assistant",
                         "content": msg.get("content") or "",
@@ -2803,7 +2803,7 @@ class AgentTUI:
                     continue
 
                 # Fallback: parse <tool_call>/<tool_use> tags from text content
-                text = msg.get("content", "")
+                text = msg.get("content") or ""
                 text_calls = parse_text_tool_calls(text)
                 if text_calls:
                     display_text = re.sub(r'<tool_(?:call|use)>.*?</tool_(?:call|use)>', '', text, flags=re.DOTALL)
