@@ -1570,6 +1570,18 @@ class AgentTUI:
         self.todo_popup_title = ""
         self._todo_popup_scrollable = False
 
+        # Image paste and popup state
+        self.pasted_images = []  # list of dicts: {filename, path}
+        self.image_popup_anim_state = "hidden"  # hidden, expanding, shown, collapsing
+        self.image_popup_anim_height = 0
+        self.image_popup_target_height = 0
+        self.image_popup_scroll = 0
+        self.image_popup_lines = []
+        self.image_popup_width = 0
+        self.image_popup_title = ""
+        self._image_popup_scrollable = False
+        self._image_view_index = None  # index of selected image in popup
+
         # Memory monitor state
         self._mem_lock = threading.Lock()
         self._mem_sys_total = 0       # total system RAM bytes
