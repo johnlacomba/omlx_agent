@@ -1629,7 +1629,8 @@ def agent_turn(messages: list, model: str) -> str:
             _p = tui_print if _tui_instance else print
             _ts = datetime.now().strftime("%H:%M:%S")
             _p(f"[{_ts}] [Generation hit token limit -- auto-continuing]", C_YELLOW if _tui_instance else 0)
-            messages.append({"role": "assistant", "content": text})
+            if text:  # don't append empty assistant turns; null content breaks some models
+                messages.append({"role": "assistant", "content": text})
             messages.append({"role": "user", "content": "[System: Your response was truncated because it hit the generation token limit. Continue EXACTLY where you left off. Do NOT repeat what you already said. If you were about to make a tool call, make it now.]"})
             continue
 
@@ -3400,7 +3401,8 @@ class AgentTUI:
                 if finish_reason == "length":
                     _ts = datetime.now().strftime("%H:%M:%S")
                     tui_print(f"[{_ts}] [Generation hit token limit -- auto-continuing]", C_YELLOW)
-                    self.messages.append({"role": "assistant", "content": text})
+                    if text:  # don't append empty assistant turns; null content breaks some models
+                        self.messages.append({"role": "assistant", "content": text})
                     self.messages.append({"role": "user", "content": "[System: Your response was truncated because it hit the generation token limit. Continue EXACTLY where you left off. Do NOT repeat what you already said. If you were about to make a tool call, make it now.]"})
                     continue
 
