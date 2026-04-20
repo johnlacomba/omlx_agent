@@ -16,7 +16,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
@@ -30,6 +29,7 @@ MAX_TOOL_ROUNDS = 40
 EMERGENCY_TRIM_DROP = 20  # Messages to drop when oMLX returns "Prompt too long"
 LEARNINGS_FILE = "compound-engineering.local.md"
 INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
+MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json")
 MAX_INPUT_HISTORY = 200
 
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
@@ -1488,7 +1488,7 @@ def normalize_api_response(response: dict) -> dict:
     return normalized
 
 
-def _is_retryable_empty_response(parsed: dict) -> bool:
+def _is_retryable_empty_response(parsed: dict, messages: list | None = None) -> bool:
     """True when response is structurally valid but carries no actionable payload yet."""
     if parsed.get("tool_calls"):
         return False
@@ -1497,8 +1497,23 @@ def _is_retryable_empty_response(parsed: dict) -> bool:
     finish_reason = parsed.get("finish_reason")
     # None/empty: partial or ambiguous provider payloads.
     # "tool_calls": model signalled a tool call but parsing failed to extract it -- retry rather than abort.
-    # "stop": excluded to avoid nudge-spam on models that repeatedly return stop+null.
-    return finish_reason in (None, "", "tool_calls")
+    if finish_reason in (None, "", "tool_calls"):
+        return True
+    if finish_reason == "stop":
+        stop_nudge = "[System: Your previous response ended with finish_reason=stop but contained no visible content or tool call. Resend your final answer or tool call, and ensure either content text or tool_calls is present.]"
+        if not isinstance(messages, list) or not messages:
+            return True
+        last_message = messages[-1] if isinstance(messages[-1], dict) else {}
+        return last_message.get("content") != stop_nudge
+    return False
+
+
+def _write_malformed_response_debug(response: dict) -> str:
+    """Persist the last malformed payload at a deterministic path for inspection."""
+    os.makedirs(os.path.dirname(MALFORMED_DEBUG_FILE), exist_ok=True)
+    with open(MALFORMED_DEBUG_FILE, "w") as debug_file:
+        json.dump(response, debug_file, indent=2, default=str)
+    return MALFORMED_DEBUG_FILE
 
 
 def execute_tool(name: str, arguments) -> str:
@@ -1638,22 +1653,24 @@ def agent_turn(messages: list, model: str) -> str:
             continue
 
         if not text:
-            if _is_retryable_empty_response(parsed) and round_num < MAX_TOOL_ROUNDS - 1:
+            if _is_retryable_empty_response(parsed, messages) and round_num < MAX_TOOL_ROUNDS - 1:
                 if finish_reason == "tool_calls":
                     nudge = "[System: Your last response indicated a tool call (finish_reason=tool_calls) but no tool call was parseable. Please resend your tool call in the standard format.]"
+                elif finish_reason == "stop":
+                    nudge = "[System: Your previous response ended with finish_reason=stop but contained no visible content or tool call. Resend your final answer or tool call, and ensure either content text or tool_calls is present.]"
                 else:
                     nudge = "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]"
                 messages.append({"role": "user", "content": nudge})
                 continue
             # Log raw response for post-mortem debugging
+            debug_path = None
             try:
-                import tempfile, os
-                _dbg_path = os.path.join(tempfile.gettempdir(), "omlx_last_malformed.json")
-                with open(_dbg_path, "w") as _f:
-                    json.dump(response, _f, indent=2, default=str)
+                debug_path = _write_malformed_response_debug(response)
             except Exception:
                 pass
             detail = parsed["error"] or f"keys={','.join(parsed['response_shape'])}"
+            if debug_path:
+                return f"[Malformed API response: {detail}; debug={debug_path}]"
             return f"[Malformed API response: {detail}]"
 
         messages.append({"role": "assistant", "content": text})
@@ -3419,22 +3436,24 @@ class AgentTUI:
                     continue
 
                 if not text:
-                    if _is_retryable_empty_response(parsed) and round_num < MAX_TOOL_ROUNDS - 1:
+                    if _is_retryable_empty_response(parsed, self.messages) and round_num < MAX_TOOL_ROUNDS - 1:
                         if finish_reason == "tool_calls":
                             nudge = "[System: Your last response indicated a tool call (finish_reason=tool_calls) but no tool call was parseable. Please resend your tool call in the standard format.]"
+                        elif finish_reason == "stop":
+                            nudge = "[System: Your previous response ended with finish_reason=stop but contained no visible content or tool call. Resend your final answer or tool call, and ensure either content text or tool_calls is present.]"
                         else:
                             nudge = "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]"
                         self.messages.append({"role": "user", "content": nudge})
                         continue
                     # Log raw response for post-mortem debugging
+                    debug_path = None
                     try:
-                        import tempfile, os
-                        _dbg_path = os.path.join(tempfile.gettempdir(), "omlx_last_malformed.json")
-                        with open(_dbg_path, "w") as _f:
-                            json.dump(response, _f, indent=2, default=str)
+                        debug_path = _write_malformed_response_debug(response)
                     except Exception:
                         pass
                     detail = parsed["error"] or f"keys={','.join(parsed['response_shape'])}"
+                    if debug_path:
+                        return f"[Malformed API response: {detail}; debug={debug_path}]"
                     return f"[Malformed API response: {detail}]"
 
                 # Final text response -- but check if the model is narrating instead of acting
