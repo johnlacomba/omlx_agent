@@ -7,11 +7,13 @@ Usage: python3 ~/omlx_agent.py [--repo /path/to/repo]
 """
 
 import base64
+import hashlib
 import curses
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1323,6 +1325,179 @@ def parse_text_tool_calls(text: str) -> list:
     return calls
 
 
+def _content_to_text(content) -> str:
+    """Normalize model content fields that may be str, dict, or list blocks."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for key in ("text", "content", "value"):
+            value = content.get(key)
+            if isinstance(value, str):
+                return value
+        return ""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            text = _content_to_text(item)
+            if text:
+                parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
+def _extract_output_text(output) -> str:
+    """Extract text from Responses-style output arrays."""
+    if not isinstance(output, list):
+        return ""
+    parts = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in ("message", "output_message"):
+            parts.append(_content_to_text(item.get("content")))
+        elif item_type in ("text", "output_text"):
+            parts.append(_content_to_text(item.get("text")))
+    return "".join(p for p in parts if p)
+
+
+def _normalize_tool_calls(msg: dict) -> list:
+    """Normalize structured tool calls from several common response formats."""
+    normalized = []
+    if not isinstance(msg, dict):
+        return normalized
+
+    raw_calls = msg.get("tool_calls")
+    if isinstance(raw_calls, list):
+        for i, tc in enumerate(raw_calls, 1):
+            if not isinstance(tc, dict):
+                continue
+            tc_id = tc.get("id") or f"call_{i}"
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+            fn_name = fn.get("name")
+            if not fn_name:
+                continue
+            fn_args = fn.get("arguments", {})
+            normalized.append({
+                "id": tc_id,
+                "function": {
+                    "name": fn_name,
+                    "arguments": fn_args,
+                },
+            })
+
+    function_call = msg.get("function_call")
+    if isinstance(function_call, dict):
+        fn_name = function_call.get("name")
+        if fn_name:
+            normalized.append({
+                "id": f"call_fc_{len(normalized) + 1}",
+                "function": {
+                    "name": fn_name,
+                    "arguments": function_call.get("arguments", {}),
+                },
+            })
+
+    return normalized
+
+
+def normalize_api_response(response: dict) -> dict:
+    """Return a tolerant normalized view of an API response."""
+    usage = response.get("usage") if isinstance(response, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+
+    normalized = {
+        "text": "",
+        "tool_calls": [],
+        "reasoning_content": "",
+        "finish_reason": None,
+        "usage": usage,
+        "error": "",
+        "response_shape": list(response.keys())[:12] if isinstance(response, dict) else [],
+    }
+
+    if not isinstance(response, dict):
+        normalized["error"] = f"response is {type(response).__name__}, expected dict"
+        return normalized
+
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+
+        normalized["text"] = _content_to_text(msg.get("content"))
+        if not normalized["text"]:
+            normalized["text"] = _content_to_text(choice.get("text"))
+        if not normalized["text"]:
+            normalized["text"] = _content_to_text(choice.get("content"))
+        if not normalized["text"]:
+            normalized["text"] = _content_to_text(msg.get("text"))
+        if not normalized["text"]:
+            normalized["text"] = _content_to_text(delta.get("content"))
+        if not normalized["text"]:
+            normalized["text"] = _content_to_text(delta.get("text"))
+        if not normalized["text"]:
+            normalized["text"] = _content_to_text(msg.get("refusal"))
+
+        normalized["reasoning_content"] = _content_to_text(msg.get("reasoning_content"))
+        if not normalized["reasoning_content"]:
+            normalized["reasoning_content"] = _content_to_text(choice.get("reasoning_content"))
+        if not normalized["reasoning_content"]:
+            normalized["reasoning_content"] = _content_to_text(msg.get("reasoning"))
+        if not normalized["reasoning_content"]:
+            normalized["reasoning_content"] = _content_to_text(delta.get("reasoning_content"))
+
+        normalized["tool_calls"] = _normalize_tool_calls(msg)
+        if not normalized["tool_calls"]:
+            normalized["tool_calls"] = _normalize_tool_calls(choice)
+        if not normalized["tool_calls"]:
+            normalized["tool_calls"] = _normalize_tool_calls(delta)
+        normalized["finish_reason"] = choice.get("finish_reason")
+        if not normalized["finish_reason"]:
+            normalized["finish_reason"] = response.get("finish_reason")
+    else:
+        msg = response.get("message") if isinstance(response.get("message"), dict) else {}
+        normalized["text"] = (
+            _content_to_text(response.get("response"))
+            or _content_to_text(response.get("content"))
+            or _content_to_text(response.get("text"))
+            or _content_to_text(response.get("output_text"))
+            or _extract_output_text(response.get("output"))
+            or _content_to_text(msg.get("content"))
+        )
+        normalized["reasoning_content"] = (
+            _content_to_text(response.get("reasoning_content"))
+            or _content_to_text(msg.get("reasoning_content"))
+        )
+        normalized["tool_calls"] = _normalize_tool_calls(msg)
+        normalized["finish_reason"] = response.get("finish_reason")
+
+    error_obj = response.get("error")
+    if isinstance(error_obj, dict):
+        normalized["error"] = error_obj.get("message") or json.dumps(error_obj)
+    elif isinstance(error_obj, str):
+        normalized["error"] = error_obj
+    elif response.get("detail"):
+        normalized["error"] = str(response.get("detail"))
+
+    return normalized
+
+
+def _is_retryable_empty_response(parsed: dict) -> bool:
+    """True when response is structurally valid but carries no actionable payload yet."""
+    if parsed.get("tool_calls"):
+        return False
+    if parsed.get("text"):
+        return False
+    finish_reason = parsed.get("finish_reason")
+    # None/empty can occur in partial or odd provider payloads; retry once/few rounds.
+    return finish_reason in (None, "", "stop")
+
+
 def execute_tool(name: str, arguments) -> str:
     if name not in TOOL_DISPATCH:
         return f"ERROR: Unknown tool '{name}'"
@@ -1393,36 +1568,41 @@ def agent_turn(messages: list, model: str) -> str:
         if not response:
             return "[API call failed]"
 
-        choice = response["choices"][0]
-        msg = choice["message"]
+        parsed = normalize_api_response(response)
+        text = parsed["text"]
+        tool_calls = parsed["tool_calls"]
+        finish_reason = parsed["finish_reason"]
 
-        if msg.get("reasoning_content"):
-            rc = msg["reasoning_content"]
+        if parsed["reasoning_content"]:
+            rc = parsed["reasoning_content"]
             display = f"{rc[:300]}..." if len(rc) > 300 else rc
             _p = tui_print if _tui_instance else print
             _ts = datetime.now().strftime("%H:%M:%S")
             _p(f"[{_ts}] [thinking] {display}", C_DIM)
 
-        if msg.get("tool_calls"):
+        if tool_calls:
             messages.append({
                 "role": "assistant",
-                "content": msg.get("content") or "",
-                "tool_calls": msg["tool_calls"],
+                "content": text,
+                "tool_calls": tool_calls,
             })
-            if msg.get("content"):
+            if text:
                 _ts = datetime.now().strftime("%H:%M:%S")
-                print(f"\n\033[33m[{_ts}] {msg['content']}\033[0m")
-            for tc in msg["tool_calls"]:
-                result = execute_tool(tc["function"]["name"], tc["function"]["arguments"])
+                print(f"\n\033[33m[{_ts}] {text}\033[0m")
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name")
+                if not name:
+                    continue
+                result = execute_tool(name, fn.get("arguments", {}))
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tc["id"],
+                    "tool_call_id": tc.get("id", "call_unknown"),
                     "content": result,
                 })
             continue
 
         # Fallback: parse <tool_call> tags from text content
-        text = msg.get("content") or ""
         text_calls = parse_text_tool_calls(text)
         if text_calls:
             # Strip tool_call/tool_use tags from displayed text
@@ -1445,13 +1625,23 @@ def agent_turn(messages: list, model: str) -> str:
             continue
 
         # Auto-continue if generation was truncated (hit max_tokens)
-        if choice.get("finish_reason") == "length":
+        if finish_reason == "length":
             _p = tui_print if _tui_instance else print
             _ts = datetime.now().strftime("%H:%M:%S")
             _p(f"[{_ts}] [Generation hit token limit -- auto-continuing]", C_YELLOW if _tui_instance else 0)
             messages.append({"role": "assistant", "content": text})
             messages.append({"role": "user", "content": "[System: Your response was truncated because it hit the generation token limit. Continue EXACTLY where you left off. Do NOT repeat what you already said. If you were about to make a tool call, make it now.]"})
             continue
+
+        if not text:
+            if _is_retryable_empty_response(parsed) and round_num < MAX_TOOL_ROUNDS - 1:
+                messages.append({
+                    "role": "user",
+                    "content": "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]",
+                })
+                continue
+            detail = parsed["error"] or f"keys={','.join(parsed['response_shape'])}"
+            return f"[Malformed API response: {detail}]"
 
         messages.append({"role": "assistant", "content": text})
         return text
@@ -1581,6 +1771,7 @@ class AgentTUI:
         self.image_popup_title = ""
         self._image_popup_scrollable = False
         self._image_view_index = None  # index of selected image in popup
+        self._last_clipboard_image_hash = None
 
         # Memory monitor state
         self._mem_lock = threading.Lock()
@@ -1972,14 +2163,14 @@ class AgentTUI:
             round_info = f"R:{getattr(self, 'current_round', 0)}"
             activity = getattr(self, '_activity', '') or 'waiting'
             status = f" {round_info} {activity} "
-            hints = "[Tab: Actions | ^C Cancel | ^O Todos | ^P Images]"
+            hints = "[Tab: Actions | ^C Cancel | ^O Todos | ^P Images | ^X Import]"
             bar = f"{status}{hints}"
             color = C_YELLOW
         else:
             mode_tag = f" [{self.active_ce_mode}]" if self.active_ce_mode else ""
             status = f" Ready{mode_tag}  Model: {self.active_model[:40]} "
             nl_hint = "Ret:newline | ^S:submit"
-            hints = f"[{nl_hint} | ^O Todos | ^P Images | ^L Clear | ^D Quit]"
+            hints = f"[{nl_hint} | ^O Todos | ^P Images | ^X Import | ^L Clear | ^D Quit]"
             bar = f"{status}{hints}"
             color = C_GREEN
 
@@ -2079,13 +2270,19 @@ class AgentTUI:
         except curses.error:
             pass
 
+        todo_popup_visible = self.todo_popup_anim_state != "hidden"
+        image_popup_visible = self.image_popup_anim_state != "hidden"
+
         # ── Action menu popup (over output area, above status bar) ────
-                # ── Image popup (drawn over output pane) ───────────────
+            # ── Image popup (drawn over output pane) ───────────────
         if self.image_popup_anim_state != "hidden":
             # Refresh content live
             anim_h = self.image_popup_anim_height
             pw = min(self.image_popup_width, w)
             inner_w = pw - 4
+            popup_x = 0
+            if todo_popup_visible:
+                            popup_x = max(0, min(w - pw, min(w - 1, self.todo_popup_width + 1)))
 
             # Animate
             if self.image_popup_anim_state == "expanding":
@@ -2120,7 +2317,7 @@ class AgentTUI:
                 pad_right = pw - 2 - len(title) - pad_left
                 top_border = "+" + "-" * pad_left + title + "-" * pad_right + "+"
                 try:
-                    self.stdscr.addnstr(popup_top, 0, top_border[:pw], pw, curses.color_pair(C_MAGENTA))
+                    self.stdscr.addnstr(popup_top, popup_x, top_border[:pw], pw, curses.color_pair(C_MAGENTA))
                 except curses.error:
                     pass
 
@@ -2146,9 +2343,9 @@ class AgentTUI:
                         padded = text[:inner_w].ljust(inner_w)
                         row_str = "| " + padded + " |"
                         try:
-                            self.stdscr.addnstr(screen_row, 0, row_str[:pw], pw, curses.color_pair(color))
-                            self.stdscr.addnstr(screen_row, 0, "|", 1, curses.color_pair(C_MAGENTA))
-                            self.stdscr.addnstr(screen_row, pw - 1, "|", 1, curses.color_pair(C_MAGENTA))
+                            self.stdscr.addnstr(screen_row, popup_x, row_str[:pw], pw, curses.color_pair(color))
+                            self.stdscr.addnstr(screen_row, popup_x, "|", 1, curses.color_pair(C_MAGENTA))
+                            self.stdscr.addnstr(screen_row, popup_x + pw - 1, "|", 1, curses.color_pair(C_MAGENTA))
                         except curses.error:
                             pass
 
@@ -2167,7 +2364,7 @@ class AgentTUI:
                 bot_fill = pw - 2 - len(arrow_str)
                 bot_border = "+" + "-" * bot_fill + arrow_str + "+"
                 try:
-                    self.stdscr.addnstr(popup_bottom, 0, bot_border[:pw], pw, curses.color_pair(C_MAGENTA))
+                    self.stdscr.addnstr(popup_bottom, popup_x, bot_border[:pw], pw, curses.color_pair(C_MAGENTA))
                 except curses.error:
                     pass
         if self.menu_open and self.agent_running:
@@ -2210,6 +2407,7 @@ class AgentTUI:
             anim_h = self.todo_popup_anim_height
             pw = min(self.todo_popup_width, w)
             inner_w = pw - 4  # "| " + " |"
+            popup_x = 0
 
             # Animate
             if self.todo_popup_anim_state == "expanding":
@@ -2243,7 +2441,7 @@ class AgentTUI:
                 pad_right = pw - 2 - len(title) - pad_left
                 top_border = "+" + "-" * pad_left + title + "-" * pad_right + "+"
                 try:
-                    self.stdscr.addnstr(popup_top, 0, top_border[:pw], pw, curses.color_pair(C_CYAN))
+                    self.stdscr.addnstr(popup_top, popup_x, top_border[:pw], pw, curses.color_pair(C_CYAN))
                 except curses.error:
                     pass
 
@@ -2283,10 +2481,10 @@ class AgentTUI:
                         padded = text[:inner_w].ljust(inner_w)
                         row_str = "| " + padded + " |"
                         try:
-                            self.stdscr.addnstr(screen_row, 0, row_str[:pw], pw, curses.color_pair(color))
+                            self.stdscr.addnstr(screen_row, popup_x, row_str[:pw], pw, curses.color_pair(color))
                             # Draw border chars in cyan
-                            self.stdscr.addnstr(screen_row, 0, "|", 1, curses.color_pair(C_CYAN))
-                            self.stdscr.addnstr(screen_row, pw - 1, "|", 1, curses.color_pair(C_CYAN))
+                            self.stdscr.addnstr(screen_row, popup_x, "|", 1, curses.color_pair(C_CYAN))
+                            self.stdscr.addnstr(screen_row, popup_x + pw - 1, "|", 1, curses.color_pair(C_CYAN))
                         except curses.error:
                             pass
 
@@ -2306,7 +2504,7 @@ class AgentTUI:
                 bot_fill = pw - 2 - len(arrow_str)
                 bot_border = "+" + "-" * bot_fill + arrow_str + "+"
                 try:
-                    self.stdscr.addnstr(popup_bottom, 0, bot_border[:pw], pw, curses.color_pair(C_CYAN))
+                    self.stdscr.addnstr(popup_bottom, popup_x, bot_border[:pw], pw, curses.color_pair(C_CYAN))
                 except curses.error:
                     pass
 
@@ -2505,73 +2703,282 @@ class AgentTUI:
                 max_popup_h = max(4, h - 8)
                 self._open_image_popup(w, max_popup_h)
             return
+        elif key == 24:  # Ctrl+X -- import clipboard image
+            self._try_paste_image()
+            return
         elif key == 22:  # Ctrl+V -- paste (check clipboard for image)
             self._try_paste_image()
             return
+
+        # --- Escape: record time for Alt+Enter detection ---
+        if key == 27:
+            self._last_escape_time = now
+            return
+
+        # --- Enter ---
+        if key in (curses.KEY_ENTER, 10, 13):
+            if (now - self._last_escape_time) < 0.15:
+                self._last_escape_time = 0.0
+                if self.agent_running and self.get_input_text().strip():
+                    self.menu_open = True
+                    self.menu_index = 0
+                    return
+                text = self.submit_input()
+                if text:
+                    self.process_user_input(text)
+                return
+            self._last_escape_time = 0.0
+            self._insert_newline()
+            return
+
+        # --- Arrow keys: Left / Right ---
+        if key == curses.KEY_LEFT:
+            if self.input_col > 0:
+                self.input_col -= 1
+            elif self.input_row > 0:
+                self.input_row -= 1
+                self.input_col = len(self.input_lines[self.input_row])
+            return
+        elif key == curses.KEY_RIGHT:
+            if self.input_col < len(self.input_lines[self.input_row]):
+                self.input_col += 1
+            elif self.input_row < len(self.input_lines) - 1:
+                self.input_row += 1
+                self.input_col = 0
+            return
+        elif key == curses.KEY_HOME or key == 1:  # Ctrl+A
+            self.input_col = 0
+            return
+        elif key == curses.KEY_END or key == 5:  # Ctrl+E
+            self.input_col = len(self.input_lines[self.input_row])
+            return
+
+        # --- Up / Down: popup scroll takes priority ---
+        if self.image_popup_anim_state == "shown" and self._image_popup_scrollable:
+            if key == curses.KEY_UP:
+                self.image_popup_scroll = max(0, self.image_popup_scroll - 1)
+                return
+            if key == curses.KEY_DOWN:
+                self.image_popup_scroll += 1
+                self.needs_redraw = True
+                return
+        elif self.todo_popup_anim_state == "shown" and self._todo_popup_scrollable:
+            if key == curses.KEY_UP:
+                self.todo_popup_scroll = max(0, self.todo_popup_scroll - 1)
+                return
+            if key == curses.KEY_DOWN:
+                self.todo_popup_scroll += 1
+                self.needs_redraw = True
+                return
+
+        # --- Image popup navigation ---
+        if self.image_popup_anim_state == "shown":
+            if key == curses.KEY_UP:
+                if self._image_view_index is None:
+                    self._image_view_index = 0
+                else:
+                    self._image_view_index = max(0, self._image_view_index - 1)
+                self.needs_redraw = True
+                return
+            elif key == curses.KEY_DOWN:
+                if self._image_view_index is None:
+                    self._image_view_index = 0
+                else:
+                    self._image_view_index = min(len(self.pasted_images) - 1, self._image_view_index + 1)
+                self.needs_redraw = True
+                return
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if self._image_view_index is not None and self._image_view_index < len(self.pasted_images):
+                    img = self.pasted_images[self._image_view_index]
+                    self._show_iterm2_image(img["path"])
+                return
+            elif key == 9:
+                self.image_popup_anim_state = "collapsing"
+                self._image_view_index = None
+                return
+
+        # --- Up / Down: navigate within lines first, then history ---
+        if key == curses.KEY_UP:
+            if self.input_row > 0:
+                self.input_row -= 1
+                self.input_col = min(self.input_col, len(self.input_lines[self.input_row]))
+                self._at_top_edge = False
+            elif self._at_top_edge:
+                if self.input_history:
+                    if self.history_index == -1:
+                        self.saved_input = self.get_input_text()
+                        self.history_index = len(self.input_history) - 1
+                    elif self.history_index > 0:
+                        self.history_index -= 1
+                    self._set_input_from_text(self.input_history[self.history_index])
+                self._at_top_edge = False
+            else:
+                self._at_top_edge = True
+            self._at_bottom_edge = False
+            return
+        elif key == curses.KEY_DOWN:
+            if self.input_row < len(self.input_lines) - 1:
+                self.input_row += 1
+                self.input_col = min(self.input_col, len(self.input_lines[self.input_row]))
+                self._at_bottom_edge = False
+            elif self._at_bottom_edge:
+                if self.history_index >= 0:
+                    if self.history_index < len(self.input_history) - 1:
+                        self.history_index += 1
+                        self._set_input_from_text(self.input_history[self.history_index])
+                    else:
+                        self.history_index = -1
+                        self._set_input_from_text(self.saved_input)
+                self._at_bottom_edge = False
+            else:
+                self._at_bottom_edge = True
+            self._at_top_edge = False
+            return
+
+        # --- Scroll output ---
+        if key == curses.KEY_PPAGE:
+            self.scroll_offset = min(self.scroll_offset + 10, max(0, len(self.output_lines) - 5))
+            return
+        elif key == curses.KEY_NPAGE:
+            self.scroll_offset = max(0, self.scroll_offset - 10)
+            return
+
+        # --- Backspace ---
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.input_col > 0:
+                self.input_lines[self.input_row].pop(self.input_col - 1)
+                self.input_col -= 1
+            elif self.input_row > 0:
+                prev_len = len(self.input_lines[self.input_row - 1])
+                self.input_lines[self.input_row - 1].extend(self.input_lines[self.input_row])
+                self.input_lines.pop(self.input_row)
+                self.input_row -= 1
+                self.input_col = prev_len
+            return
+
+        # --- Delete ---
+        if key == curses.KEY_DC:
+            if self.input_col < len(self.input_lines[self.input_row]):
+                self.input_lines[self.input_row].pop(self.input_col)
+            elif self.input_row < len(self.input_lines) - 1:
+                self.input_lines[self.input_row].extend(self.input_lines[self.input_row + 1])
+                self.input_lines.pop(self.input_row + 1)
+            return
+
+        # --- Kill line (Ctrl+K) ---
+        if key == 11:
+            self.input_lines[self.input_row] = self.input_lines[self.input_row][:self.input_col]
+            return
+
+        # --- Kill to start (Ctrl+U) ---
+        if key == 21:
+            self.input_lines[self.input_row] = self.input_lines[self.input_row][self.input_col:]
+            self.input_col = 0
+            return
+
+        # --- Normal character (including pasted content with newlines) ---
+        if isinstance(key, int) and 32 <= key <= 126:
+            ch = chr(key)
+            self.input_lines[self.input_row].insert(self.input_col, ch)
+            self.input_col += 1
+        elif isinstance(key, str) and len(key) == 1:
+            if key == "\n":
+                self._insert_newline()
+            elif ord(key) >= 32:
+                self.input_lines[self.input_row].insert(self.input_col, key)
+                self.input_col += 1
+
     # ── Image paste helpers ─────────────────────────────────────────────────
+
+    def _save_clipboard_image(self):
+        """Save the current macOS clipboard image to disk and return metadata.
+        Returns None when the clipboard does not currently contain an image.
+        """
+        osascript_cmd = shutil.which("osascript") or "/usr/bin/osascript"
+        if not os.path.exists(osascript_cmd):
+            raise RuntimeError("osascript not found")
+
+        # Check if clipboard has image data via osascript
+        check = subprocess.run(
+            [osascript_cmd, "-e",
+             'try\n'
+             '  set imgData to (the clipboard as TIFF picture)\n'
+             '  return "yes"\n'
+             'on error\n'
+             '  return "no"\n'
+             'end try'],
+            capture_output=True, text=True, timeout=3
+        )
+        if check.stdout.strip() != "yes":
+            return None
+
+        os.makedirs(os.path.expanduser("~/.omlx/images"), exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        idx = len(self.pasted_images) + 1
+        filename = f"paste-{ts}-{idx}.png"
+        dest = os.path.expanduser(f"~/.omlx/images/{filename}")
+
+        pngpaste_cmd = shutil.which("pngpaste")
+        saved = False
+
+        # Fast path when pngpaste is installed.
+        if pngpaste_cmd:
+            result = subprocess.run([pngpaste_cmd, dest], capture_output=True)
+            saved = result.returncode == 0 and os.path.exists(dest)
+
+        # Fallback path (built-in macOS tools): osascript -> TIFF -> sips -> PNG.
+        if not saved:
+            tiff_dest = dest.replace(".png", ".tiff")
+            script = (
+                f'set imgData to (the clipboard as TIFF picture)\n'
+                f'set f to open for access POSIX file "{tiff_dest}" with write permission\n'
+                f'write imgData to f\n'
+                f'close access f'
+            )
+            r2 = subprocess.run([osascript_cmd, "-e", script], capture_output=True)
+            if r2.returncode == 0 and os.path.exists(tiff_dest):
+                sips_cmd = shutil.which("sips") or "/usr/bin/sips"
+                if os.path.exists(sips_cmd):
+                    subprocess.run([sips_cmd, "-s", "format", "png", tiff_dest, "--out", dest], capture_output=True)
+                    saved = os.path.exists(dest)
+                try:
+                    os.remove(tiff_dest)
+                except OSError:
+                    pass
+
+        if not os.path.exists(dest):
+            return None
+
+        with open(dest, "rb") as image_file:
+            image_hash = hashlib.sha1(image_file.read()).hexdigest()
+
+        return {"filename": filename, "path": dest, "hash": image_hash}
+
+    def _insert_image_reference(self, filename: str):
+        tag = f"[image:{filename}]"
+        for ch in tag:
+            self.input_lines[self.input_row].insert(self.input_col, ch)
+            self.input_col += 1
+
+    def _refresh_image_popup_if_open(self):
+        if self.image_popup_anim_state in ("shown", "expanding"):
+            h, w = self.stdscr.getmaxyx()
+            self._open_image_popup(w, max(4, h - 8))
 
     def _try_paste_image(self):
         """Try to read an image from the macOS clipboard and save it as a temp file."""
         try:
-            # Check if clipboard has image data via osascript
-            check = subprocess.run(
-                ["osascript", "-e",
-                 'try\n'
-                 '  set imgData to (the clipboard as TIFF picture)\n'
-                 '  return "yes"\n'
-                 'on error\n'
-                 '  return "no"\n'
-                 'end try'],
-                capture_output=True, text=True, timeout=3
-            )
-            if check.stdout.strip() != "yes":
-                # Not an image -- let the normal paste fall through to text
+            saved = self._save_clipboard_image()
+            if not saved:
                 return
 
-            # Save clipboard image to a temp PNG via pngpaste (preferred) or screencapture
-            os.makedirs(os.path.expanduser("~/.omlx/images"), exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            idx = len(self.pasted_images) + 1
-            filename = f"paste-{ts}-{idx}.png"
-            dest = os.path.expanduser(f"~/.omlx/images/{filename}")
-
-            # Try pngpaste first (brew install pngpaste)
-            result = subprocess.run(["pngpaste", dest], capture_output=True)
-            if result.returncode != 0:
-                # Fallback: use osascript to write TIFF then convert
-                tiff_dest = dest.replace(".png", ".tiff")
-                script = (
-                    f'set imgData to (the clipboard as TIFF picture)\n'
-                    f'set f to open for access POSIX file "{tiff_dest}" with write permission\n'
-                    f'write imgData to f\n'
-                    f'close access f'
-                )
-                r2 = subprocess.run(["osascript", "-e", script], capture_output=True)
-                if r2.returncode == 0 and os.path.exists(tiff_dest):
-                    # Convert TIFF to PNG via sips
-                    subprocess.run(["sips", "-s", "format", "png", tiff_dest, "--out", dest],
-                                   capture_output=True)
-                    try:
-                        os.remove(tiff_dest)
-                    except OSError:
-                        pass
-
-            if os.path.exists(dest):
-                self.pasted_images.append({"filename": filename, "path": dest})
-                # Insert a reference tag into the input buffer
-                tag = f"[image:{filename}]"
-                for ch in tag:
-                    self.input_lines[self.input_row].insert(self.input_col, ch)
-                    self.input_col += 1
-                self.add_output(f"[Image pasted: {filename} | Ctrl+P to manage images]", C_MAGENTA)
-                # Refresh popup if open
-                if self.image_popup_anim_state in ("shown", "expanding"):
-                    h, w = self.stdscr.getmaxyx()
-                    self._open_image_popup(w, max(4, h - 8))
-            else:
-                self.add_output("[Image paste failed: could not save PNG]", C_RED)
-        except FileNotFoundError:
-            self.add_output("[Image paste skipped: osascript not available]", C_DIM)
+            self._last_clipboard_image_hash = saved["hash"]
+            self.pasted_images.append({"filename": saved["filename"], "path": saved["path"]})
+            self._insert_image_reference(saved["filename"])
+            self.add_output(f"[Image pasted: {saved['filename']} | Ctrl+P to manage images]", C_MAGENTA)
+            self._refresh_image_popup_if_open()
+        except RuntimeError as exc:
+            self.add_output(f"[Image paste skipped: {exc}]", C_DIM)
         except Exception as exc:
             self.add_output(f"[Image paste error: {exc}]", C_RED)
 
@@ -2638,197 +3045,6 @@ class AgentTUI:
         self.image_popup_anim_height = 1
         self._image_view_index = None
         self.needs_redraw = True
-
-        # --- Escape: record time for Alt+Enter detection ---
-        if key == 27:
-            self._last_escape_time = now
-            return
-
-        # --- Enter ---
-        if key in (curses.KEY_ENTER, 10, 13):
-            # Alt+Enter (Esc then Enter): submit
-            if (now - self._last_escape_time) < 0.15:
-                self._last_escape_time = 0.0
-                if self.agent_running and self.get_input_text().strip():
-                    self.menu_open = True
-                    self.menu_index = 0
-                    return
-                text = self.submit_input()
-                if text:
-                    self.process_user_input(text)
-                return
-            self._last_escape_time = 0.0
-            # Regular Enter: insert newline
-            self._insert_newline()
-            return
-
-        # --- Arrow keys: Left / Right ---
-        if key == curses.KEY_LEFT:
-            if self.input_col > 0:
-                self.input_col -= 1
-            elif self.input_row > 0:
-                # Wrap to end of previous line
-                self.input_row -= 1
-                self.input_col = len(self.input_lines[self.input_row])
-            return
-        elif key == curses.KEY_RIGHT:
-            if self.input_col < len(self.input_lines[self.input_row]):
-                self.input_col += 1
-            elif self.input_row < len(self.input_lines) - 1:
-                # Wrap to start of next line
-                self.input_row += 1
-                self.input_col = 0
-            return
-        elif key == curses.KEY_HOME or key == 1:  # Ctrl+A
-            self.input_col = 0
-            return
-        elif key == curses.KEY_END or key == 5:  # Ctrl+E
-            self.input_col = len(self.input_lines[self.input_row])
-            return
-
-        # --- Up / Down: popup scroll takes priority ---
-        if self.image_popup_anim_state == "shown" and self._image_popup_scrollable:
-            if key == curses.KEY_UP:
-                self.image_popup_scroll = max(0, self.image_popup_scroll - 1)
-                return
-            if key == curses.KEY_DOWN:
-                self.image_popup_scroll += 1
-                self.needs_redraw = True
-                return
-        elif self.todo_popup_anim_state == "shown" and self._todo_popup_scrollable:
-            if key == curses.KEY_UP:
-                self.todo_popup_scroll = max(0, self.todo_popup_scroll - 1)
-                return
-            if key == curses.KEY_DOWN:
-                self.todo_popup_scroll += 1
-                self.needs_redraw = True
-                return
-
-        # --- Image popup navigation ---
-        if self.image_popup_anim_state == "shown":
-            # Up/Down to move selection
-            if key == curses.KEY_UP:
-                if self._image_view_index is None:
-                    self._image_view_index = 0
-                else:
-                    self._image_view_index = max(0, self._image_view_index - 1)
-                self.needs_redraw = True
-                return
-            elif key == curses.KEY_DOWN:
-                if self._image_view_index is None:
-                    self._image_view_index = 0
-                else:
-                    self._image_view_index = min(len(self.pasted_images) - 1, self._image_view_index + 1)
-                self.needs_redraw = True
-                return
-            elif key in (curses.KEY_ENTER, 10, 13):
-                if self._image_view_index is not None and self._image_view_index < len(self.pasted_images):
-                    img = self.pasted_images[self._image_view_index]
-                    self._show_iterm2_image(img["path"])
-                return
-            elif key == 27 or key == 9:
-                self.image_popup_anim_state = "collapsing"
-                self._image_view_index = None
-                return
-
-
-
-        # --- Up / Down: navigate within lines first, then history ---
-        if key == curses.KEY_UP:
-            if self.input_row > 0:
-                # Move up within multiline input
-                self.input_row -= 1
-                self.input_col = min(self.input_col, len(self.input_lines[self.input_row]))
-                self._at_top_edge = False
-            elif self._at_top_edge:
-                # Already at top and pressed Up again: browse history
-                if self.input_history:
-                    if self.history_index == -1:
-                        self.saved_input = self.get_input_text()
-                        self.history_index = len(self.input_history) - 1
-                    elif self.history_index > 0:
-                        self.history_index -= 1
-                    self._set_input_from_text(self.input_history[self.history_index])
-                self._at_top_edge = False
-            else:
-                self._at_top_edge = True
-            self._at_bottom_edge = False
-            return
-        elif key == curses.KEY_DOWN:
-            if self.input_row < len(self.input_lines) - 1:
-                # Move down within multiline input
-                self.input_row += 1
-                self.input_col = min(self.input_col, len(self.input_lines[self.input_row]))
-                self._at_bottom_edge = False
-            elif self._at_bottom_edge:
-                # Already at bottom and pressed Down again: browse history forward
-                if self.history_index >= 0:
-                    if self.history_index < len(self.input_history) - 1:
-                        self.history_index += 1
-                        self._set_input_from_text(self.input_history[self.history_index])
-                    else:
-                        self.history_index = -1
-                        self._set_input_from_text(self.saved_input)
-                self._at_bottom_edge = False
-            else:
-                self._at_bottom_edge = True
-            self._at_top_edge = False
-            return
-
-        # --- Scroll output ---
-        if key == curses.KEY_PPAGE:
-            self.scroll_offset = min(self.scroll_offset + 10, max(0, len(self.output_lines) - 5))
-            return
-        elif key == curses.KEY_NPAGE:
-            self.scroll_offset = max(0, self.scroll_offset - 10)
-            return
-
-        # --- Backspace ---
-        if key in (curses.KEY_BACKSPACE, 127, 8):
-            if self.input_col > 0:
-                self.input_lines[self.input_row].pop(self.input_col - 1)
-                self.input_col -= 1
-            elif self.input_row > 0:
-                # Join with previous line
-                prev_len = len(self.input_lines[self.input_row - 1])
-                self.input_lines[self.input_row - 1].extend(self.input_lines[self.input_row])
-                self.input_lines.pop(self.input_row)
-                self.input_row -= 1
-                self.input_col = prev_len
-            return
-
-        # --- Delete ---
-        if key == curses.KEY_DC:
-            if self.input_col < len(self.input_lines[self.input_row]):
-                self.input_lines[self.input_row].pop(self.input_col)
-            elif self.input_row < len(self.input_lines) - 1:
-                # Join with next line
-                self.input_lines[self.input_row].extend(self.input_lines[self.input_row + 1])
-                self.input_lines.pop(self.input_row + 1)
-            return
-
-        # --- Kill line (Ctrl+K) ---
-        if key == 11:
-            self.input_lines[self.input_row] = self.input_lines[self.input_row][:self.input_col]
-            return
-
-        # --- Kill to start (Ctrl+U) ---
-        if key == 21:
-            self.input_lines[self.input_row] = self.input_lines[self.input_row][self.input_col:]
-            self.input_col = 0
-            return
-
-        # --- Normal character (including pasted content with newlines) ---
-        if isinstance(key, int) and 32 <= key <= 126:
-            ch = chr(key)
-            self.input_lines[self.input_row].insert(self.input_col, ch)
-            self.input_col += 1
-        elif isinstance(key, str) and len(key) == 1:
-            if key == "\n":
-                self._insert_newline()
-            elif ord(key) >= 32:
-                self.input_lines[self.input_row].insert(self.input_col, key)
-                self.input_col += 1
 
     # ── Command dispatch ─────────────────────────────────────────────────
 
@@ -3117,46 +3333,51 @@ class AgentTUI:
                 if not response:
                     return "[API call failed]"
 
-                choice = response["choices"][0]
-                msg = choice["message"]
+                parsed = normalize_api_response(response)
+                text = parsed["text"]
+                tool_calls = parsed["tool_calls"]
+                finish_reason = parsed["finish_reason"]
 
                 # Show usage info if available
-                usage = response.get("usage", {})
+                usage = parsed["usage"]
                 if usage:
                     prompt_tok = usage.get("prompt_tokens", 0)
                     gen_tok = usage.get("completion_tokens", 0)
                     self._activity = f"tokens: {prompt_tok}p/{gen_tok}g"
                     self.needs_redraw = True
 
-                if msg.get("reasoning_content"):
+                if parsed["reasoning_content"]:
                     self._activity = "thinking..."
                     self.needs_redraw = True
-                    rc = msg["reasoning_content"]
+                    rc = parsed["reasoning_content"]
                     display = f"{rc[:300]}..." if len(rc) > 300 else rc
                     _ts = datetime.now().strftime("%H:%M:%S")
                     tui_print(f"[{_ts}] [thinking] {display}", C_DIM)
 
                 # Structured tool calls
-                if msg.get("tool_calls"):
+                if tool_calls:
                     self.messages.append({
                         "role": "assistant",
-                        "content": msg.get("content") or "",
-                        "tool_calls": msg["tool_calls"],
+                        "content": text,
+                        "tool_calls": tool_calls,
                     })
-                    if msg.get("content"):
+                    if text:
                         _ts = datetime.now().strftime("%H:%M:%S")
-                        tui_print(f"[{_ts}] {msg['content']}", C_YELLOW)
-                    for tc in msg["tool_calls"]:
-                        result = execute_tool(tc["function"]["name"], tc["function"]["arguments"])
+                        tui_print(f"[{_ts}] {text}", C_YELLOW)
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name")
+                        if not name:
+                            continue
+                        result = execute_tool(name, fn.get("arguments", {}))
                         self.messages.append({
                             "role": "tool",
-                            "tool_call_id": tc["id"],
+                            "tool_call_id": tc.get("id", "call_unknown"),
                             "content": result,
                         })
                     continue
 
                 # Fallback: parse <tool_call>/<tool_use> tags from text content
-                text = msg.get("content") or ""
                 text_calls = parse_text_tool_calls(text)
                 if text_calls:
                     display_text = re.sub(r'<tool_(?:call|use)>.*?</tool_(?:call|use)>', '', text, flags=re.DOTALL)
@@ -3176,12 +3397,22 @@ class AgentTUI:
                     continue
 
                 # Auto-continue if generation was truncated (hit max_tokens)
-                if choice.get("finish_reason") == "length":
+                if finish_reason == "length":
                     _ts = datetime.now().strftime("%H:%M:%S")
                     tui_print(f"[{_ts}] [Generation hit token limit -- auto-continuing]", C_YELLOW)
                     self.messages.append({"role": "assistant", "content": text})
                     self.messages.append({"role": "user", "content": "[System: Your response was truncated because it hit the generation token limit. Continue EXACTLY where you left off. Do NOT repeat what you already said. If you were about to make a tool call, make it now.]"})
                     continue
+
+                if not text:
+                    if _is_retryable_empty_response(parsed) and round_num < MAX_TOOL_ROUNDS - 1:
+                        self.messages.append({
+                            "role": "user",
+                            "content": "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]",
+                        })
+                        continue
+                    detail = parsed["error"] or f"keys={','.join(parsed['response_shape'])}"
+                    return f"[Malformed API response: {detail}]"
 
                 # Final text response -- but check if the model is narrating instead of acting
                 self.messages.append({"role": "assistant", "content": text})
@@ -3337,6 +3568,8 @@ Navigation:
   Left/Right          Move cursor in input
   Ctrl+A/Ctrl+E       Home/End of input
   Ctrl+O              Toggle todo list popup
+    Ctrl+P              Toggle image list popup
+    Ctrl+X              Import clipboard image
   Ctrl+U/Ctrl+K       Kill line before/after cursor
   PageUp/PageDn       Scroll output
   Ctrl+L              Clear output"""
