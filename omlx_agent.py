@@ -1375,11 +1375,12 @@ def _normalize_tool_calls(msg: dict) -> list:
             if not isinstance(tc, dict):
                 continue
             tc_id = tc.get("id") or f"call_{i}"
-            fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
-            fn_name = fn.get("name")
+            # Try nested .function first, then top-level keys as fallback
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+            fn_name = (fn.get("name") if fn else None) or tc.get("name")
             if not fn_name:
                 continue
-            fn_args = fn.get("arguments", {})
+            fn_args = (fn.get("arguments") if fn else None) or tc.get("arguments") or tc.get("parameters") or {}
             normalized.append({
                 "id": tc_id,
                 "function": {
@@ -1494,8 +1495,10 @@ def _is_retryable_empty_response(parsed: dict) -> bool:
     if parsed.get("text"):
         return False
     finish_reason = parsed.get("finish_reason")
-    # None/empty can occur in partial or odd provider payloads; retry once/few rounds.
-    return finish_reason in (None, "", "stop")
+    # None/empty: partial or ambiguous provider payloads.
+    # "tool_calls": model signalled a tool call but parsing failed to extract it -- retry rather than abort.
+    # "stop": excluded to avoid nudge-spam on models that repeatedly return stop+null.
+    return finish_reason in (None, "", "tool_calls")
 
 
 def execute_tool(name: str, arguments) -> str:
@@ -1636,11 +1639,20 @@ def agent_turn(messages: list, model: str) -> str:
 
         if not text:
             if _is_retryable_empty_response(parsed) and round_num < MAX_TOOL_ROUNDS - 1:
-                messages.append({
-                    "role": "user",
-                    "content": "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]",
-                })
+                if finish_reason == "tool_calls":
+                    nudge = "[System: Your last response indicated a tool call (finish_reason=tool_calls) but no tool call was parseable. Please resend your tool call in the standard format.]"
+                else:
+                    nudge = "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]"
+                messages.append({"role": "user", "content": nudge})
                 continue
+            # Log raw response for post-mortem debugging
+            try:
+                import tempfile, os
+                _dbg_path = os.path.join(tempfile.gettempdir(), "omlx_last_malformed.json")
+                with open(_dbg_path, "w") as _f:
+                    json.dump(response, _f, indent=2, default=str)
+            except Exception:
+                pass
             detail = parsed["error"] or f"keys={','.join(parsed['response_shape'])}"
             return f"[Malformed API response: {detail}]"
 
@@ -3408,11 +3420,20 @@ class AgentTUI:
 
                 if not text:
                     if _is_retryable_empty_response(parsed) and round_num < MAX_TOOL_ROUNDS - 1:
-                        self.messages.append({
-                            "role": "user",
-                            "content": "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]",
-                        })
+                        if finish_reason == "tool_calls":
+                            nudge = "[System: Your last response indicated a tool call (finish_reason=tool_calls) but no tool call was parseable. Please resend your tool call in the standard format.]"
+                        else:
+                            nudge = "[System: Your previous response had no visible content or tool call. Reply with either plain text content or a structured tool call now.]"
+                        self.messages.append({"role": "user", "content": nudge})
                         continue
+                    # Log raw response for post-mortem debugging
+                    try:
+                        import tempfile, os
+                        _dbg_path = os.path.join(tempfile.gettempdir(), "omlx_last_malformed.json")
+                        with open(_dbg_path, "w") as _f:
+                            json.dump(response, _f, indent=2, default=str)
+                    except Exception:
+                        pass
                     detail = parsed["error"] or f"keys={','.join(parsed['response_shape'])}"
                     return f"[Malformed API response: {detail}]"
 
