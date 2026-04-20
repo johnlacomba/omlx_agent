@@ -1181,9 +1181,55 @@ def set_omlx_concurrency(n: int) -> bool:
     return set_omlx_settings({"max_concurrent_requests": n})
 
 
-# CE modes that use the thinking model vs the work model
-THINKING_MODES = {"ideate", "brainstorm", "plan"}
-WORK_MODES = {"work", "review", "compound", "debug"}
+def unload_omlx_model(model_name: str) -> bool:
+    """Force unload a model from oMLX to free memory before loading a different one."""
+    _p = tui_print if _tui_instance else print
+    cookie = _omlx_admin_login()
+    if not cookie:
+        _p(f"[Warning: Could not login to admin API for model unload]", C_YELLOW if _tui_instance else 0)
+        return False
+    try:
+        payload = json.dumps({"model": model_name}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{API_URL.replace('/v1', '')}/admin/api/model/unload",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": f"omlx_admin_session={cookie}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        _p(f"[Unloaded model: {model_name}]", C_DIM if _tui_instance else 0)
+        return True
+    except urllib.error.HTTPError as e:
+        _p(f"[Model unload HTTP {e.code} for {model_name}]", C_YELLOW if _tui_instance else 0)
+        return False
+    except Exception as e:
+        _p(f"[Model unload error: {e}]", C_YELLOW if _tui_instance else 0)
+        return False
+
+
+# Map each CE mode to its model group
+CE_MODE_TO_GROUP = {
+    "ideate": "ideate_brainstorm",
+    "brainstorm": "ideate_brainstorm",
+    "plan": "plan",
+    "work": "work",
+    "debug": "work",
+    "review": "review",
+    "compound": "compound",
+}
+
+# Ordered list of model groups for startup selection
+MODEL_GROUPS = [
+    ("ideate_brainstorm", "Ideate/Brainstorm", "/ce:ideate, /ce:brainstorm"),
+    ("plan", "Planning", "/ce:plan"),
+    ("work", "Work/Debug/Chat", "/ce:work, /ce:debug, general chat"),
+    ("review", "Review", "/ce:review"),
+    ("compound", "Compound", "/ce:compound"),
+]
 
 
 # ── Agent Loop ───────────────────────────────────────────────────────────────
@@ -1464,14 +1510,10 @@ class AgentTUI:
     """Curses-based TUI with separate output/input panes and async agent."""
 
     def __init__(self, model_config: dict, messages: list, active_ce_mode: str = None, models: list = None):
-        self.thinking_model = model_config["thinking"]
-        self.thinking_concurrency = model_config.get("thinking_concurrency", 1)
-        self.thinking_memory = model_config.get("thinking_memory")
-        self.work_model = model_config["work"]
-        self.work_concurrency = model_config.get("work_concurrency", 1)
-        self.work_memory = model_config.get("work_memory")
-        self._current_concurrency = None
-        self._current_memory = None
+        # model_config: dict of group_name -> {"model": str, "concurrency": int, "memory": str}
+        self.model_groups = model_config
+        self._current_group = None   # which model group's settings are active on oMLX
+        self._current_model_name = None  # which model is currently loaded
         self.messages = messages
         self.active_ce_mode = active_ce_mode
         self.models = models or []
@@ -1685,26 +1727,36 @@ class AgentTUI:
         return f"{b / (1024**3):.1f}GB"
 
     @property
+    def active_group(self) -> str:
+        """Return the model group key for the current CE mode."""
+        return CE_MODE_TO_GROUP.get(self.active_ce_mode, "work")
+
+    @property
     def active_model(self) -> str:
         """Return the right model based on current CE mode."""
-        if self.active_ce_mode in THINKING_MODES:
-            return self.thinking_model
-        return self.work_model
+        return self.model_groups[self.active_group]["model"]
 
-    def _ensure_concurrency(self):
-        """Set oMLX concurrency and memory limit for the active model if changed."""
-        is_thinking = self.active_ce_mode in THINKING_MODES
-        target_conc = self.thinking_concurrency if is_thinking else self.work_concurrency
-        target_mem = self.thinking_memory if is_thinking else self.work_memory
-        settings = {}
-        if target_conc != self._current_concurrency:
-            settings["max_concurrent_requests"] = target_conc
-            self._current_concurrency = target_conc
-        if target_mem and target_mem != self._current_memory:
-            settings["max_model_memory"] = target_mem
-            self._current_memory = target_mem
-        if settings:
+    def _ensure_model(self):
+        """Ensure the correct model is loaded for the current CE mode.
+        Unloads the previous model if switching to a different one."""
+        group = self.active_group
+        config = self.model_groups[group]
+        new_model = config["model"]
+
+        if group != self._current_group:
+            # Unload old model if it's different from the new one
+            if self._current_model_name and self._current_model_name != new_model:
+                unload_omlx_model(self._current_model_name)
+
+            # Apply new concurrency and memory settings
+            settings = {"max_concurrent_requests": config.get("concurrency", 1)}
+            mem = config.get("memory")
+            if mem:
+                settings["max_model_memory"] = mem
             set_omlx_settings(settings)
+
+            self._current_group = group
+            self._current_model_name = new_model
 
     # ── Output management ────────────────────────────────────────────────
 
@@ -2549,13 +2601,13 @@ class AgentTUI:
             self.add_output("Conversation, todos, and critical context cleared.", C_GREEN)
             return
         elif text == "/status":
-            lines = [
-                f"Thinking model: {self.thinking_model} (concurrency: {self.thinking_concurrency})",
-                f"Work model: {self.work_model} (concurrency: {self.work_concurrency})",
-                f"Active model: {self.active_model}",
-                f"Messages: {len(self.messages)}",
-                f"Working dir: {WORK_DIR}",
-            ]
+            lines = ["Model assignments:"]
+            for gk, gl, gd in MODEL_GROUPS:
+                cfg = self.model_groups[gk]
+                lines.append(f"  {gl}: {cfg['model']} (conc: {cfg.get('concurrency', 1)})")
+            lines.append(f"Active: {self.active_model} [{self.active_group}]")
+            lines.append(f"Messages: {len(self.messages)}")
+            lines.append(f"Working dir: {WORK_DIR}")
             if self.active_ce_mode:
                 lines.append(f"CE Mode: {self.active_ce_mode}")
             if SESSION_TODOS:
@@ -2623,22 +2675,24 @@ class AgentTUI:
         self._run_agent_async()
 
     def _handle_model_switch(self):
-        """Show model list; user types a number to switch thinking or work model."""
+        """Show model list; user types a group prefix + model number to switch."""
         if not self.models:
             self.add_output("No models available.", C_RED)
             return
-        lines = [
-            "Current models:",
-            f"  Thinking: {self.thinking_model}",
-            f"  Work: {self.work_model}",
-            "",
-            "Available Models:",
-        ]
+        group_keys = [gk for gk, _, _ in MODEL_GROUPS]
+        lines = ["Current model assignments:"]
+        for i, (gk, gl, _) in enumerate(MODEL_GROUPS):
+            cfg = self.model_groups[gk]
+            prefix = chr(ord('a') + i)  # a, b, c, d, e
+            lines.append(f"  {prefix}) {gl}: {cfg['model']}")
+        lines.append("")
+        lines.append("Available Models:")
         for i, m in enumerate(self.models, 1):
             lines.append(f"  {i}. {m}")
         lines.append("")
-        lines.append("Type 't<N>' to set thinking model, 'w<N>' for work model:")
-        lines.append("  e.g. t1 = set thinking to model 1, w2 = set work to model 2")
+        lines.append("Type '<letter><N>' to change a group's model:")
+        lines.append("  a=Ideate/Brainstorm, b=Plan, c=Work, d=Review, e=Compound")
+        lines.append("  e.g. a1 = set Ideate/Brainstorm to model 1, c2 = set Work to model 2")
         self.add_output("\n".join(lines), C_DEFAULT)
         self._pending_model_select = True
 
@@ -2648,47 +2702,31 @@ class AgentTUI:
             return False
         self._pending_model_select = False
         text = text.strip().lower()
-        if len(text) >= 2 and text[0] in ('t', 'w'):
-            try:
-                idx = int(text[1:]) - 1
-                if 0 <= idx < len(self.models):
-                    chosen = self.models[idx]
-                    if text[0] == 't':
-                        self.thinking_model = chosen
-                        self.add_output(f"Thinking model: {chosen}", C_GREEN)
-                        # Ask for concurrency
-                        self.add_output("Concurrency for this model? (Enter a number, default=1):", C_DEFAULT)
-                        self._pending_concurrency = "thinking"
-                    else:
-                        self.work_model = chosen
-                        self.add_output(f"Work model: {chosen}", C_GREEN)
-                        self.add_output("Concurrency for this model? (Enter a number, default=1):", C_DEFAULT)
-                        self._pending_concurrency = "work"
-                    return True
-            except ValueError:
-                pass
-        self.add_output("Invalid choice. Use t<N> or w<N> (e.g. t1, w2).", C_YELLOW)
+        group_keys = [gk for gk, _, _ in MODEL_GROUPS]
+        group_labels = [gl for _, gl, _ in MODEL_GROUPS]
+        if len(text) >= 2 and text[0] in 'abcde':
+            group_idx = ord(text[0]) - ord('a')
+            if group_idx < len(group_keys):
+                try:
+                    model_idx = int(text[1:]) - 1
+                    if 0 <= model_idx < len(self.models):
+                        chosen = self.models[model_idx]
+                        gk = group_keys[group_idx]
+                        old_model = self.model_groups[gk]["model"]
+                        conc, mem = _estimate_model_defaults(chosen, gk)
+                        self.model_groups[gk] = {"model": chosen, "concurrency": conc, "memory": mem}
+                        # Force model reload on next API call
+                        self._current_group = None
+                        self.add_output(f"{group_labels[group_idx]}: {chosen} (conc: {conc}, mem: {mem})", C_GREEN)
+                        return True
+                except ValueError:
+                    pass
+        self.add_output("Invalid choice. Use <letter><N> (e.g. a1, c2). Letters: a-e.", C_YELLOW)
         return True
 
     def _try_concurrency_select(self, text: str) -> bool:
-        """Handle concurrency setting after model switch."""
-        pending = getattr(self, '_pending_concurrency', None)
-        if not pending:
-            return False
-        self._pending_concurrency = None
-        try:
-            n = int(text.strip())
-            if n < 1:
-                n = 1
-        except ValueError:
-            n = 1
-        if pending == "thinking":
-            self.thinking_concurrency = n
-            self.add_output(f"Thinking concurrency: {n}", C_GREEN)
-        else:
-            self.work_concurrency = n
-            self.add_output(f"Work concurrency: {n}", C_GREEN)
-        return True
+        """No longer used - concurrency is auto-estimated."""
+        return False
 
     # ── Threaded agent execution ─────────────────────────────────────────
 
@@ -2743,7 +2781,7 @@ class AgentTUI:
                 except queue.Empty:
                     pass
 
-                self._ensure_concurrency()
+                self._ensure_model()
                 self._activity = "calling API..."
                 self.needs_redraw = True
                 response = api_call(self.messages, self.active_model)
@@ -2895,8 +2933,9 @@ class AgentTUI:
 
         self.add_output("oMLX Coding Agent + Compound Engineering", C_GREEN)
         self.add_output(f"Working directory: {WORK_DIR}", C_DEFAULT)
-        self.add_output(f"Thinking: {self.thinking_model} (concurrency: {self.thinking_concurrency})", C_GREEN)
-        self.add_output(f"Work: {self.work_model} (concurrency: {self.work_concurrency})", C_GREEN)
+        for gk, gl, _ in MODEL_GROUPS:
+            cfg = self.model_groups[gk]
+            self.add_output(f"  {gl}: {cfg['model']} (conc: {cfg.get('concurrency', 1)})", C_GREEN)
         self.add_output("Type /help for commands. Start typing to chat.", C_DIM)
         self.add_output("-" * 60, C_DIM)
 
@@ -2925,13 +2964,8 @@ class AgentTUI:
                 else:
                     key_int = key
 
-                # Check model select or concurrency select mode first
+                # Check model select mode first
                 if key_int in (curses.KEY_ENTER, 10, 13):
-                    if getattr(self, '_pending_concurrency', None):
-                        text = self.get_input_text().strip()
-                        self.clear_input()
-                        self._try_concurrency_select(text)
-                        continue
                     if getattr(self, '_pending_model_select', False):
                         text = self.get_input_text().strip()
                         self.clear_input()
@@ -2949,7 +2983,7 @@ class AgentTUI:
 
 
 HELP_TEXT = """Commands:
-  /model              Switch thinking/work model (t<N> or w<N>)
+  /model              Switch model for a CE step group (a-e + model#)
   /clear              Clear conversation
   /status             Show git status and session info
   /quit               Exit (also Ctrl+D)
@@ -2982,7 +3016,7 @@ Navigation:
   Ctrl+L              Clear output"""
 
 
-def _estimate_model_defaults(model_name: str, role: str) -> tuple:
+def _estimate_model_defaults(model_name: str, group_key: str) -> tuple:
     """Estimate intelligent defaults for concurrency and memory based on model name."""
     name = model_name.lower()
     # Detect quantization from model name
@@ -2998,8 +3032,8 @@ def _estimate_model_defaults(model_name: str, role: str) -> tuple:
     # Memory: weights + headroom for KV cache + activations
     # 48GB total, ~6GB OS, so ~42GB usable
     mem_gb = min(weight_gb + 12, 40)
-    # Concurrency: larger models get fewer concurrent requests
-    if role.lower() == "thinking":
+    # Concurrency: thinking-like groups get 1, others depend on model size
+    if group_key in ("ideate_brainstorm", "plan"):
         conc = 1  # thinking = single focused request
     elif weight_gb >= 20:
         conc = 1  # large model, keep it simple
@@ -3009,50 +3043,59 @@ def _estimate_model_defaults(model_name: str, role: str) -> tuple:
     return conc, f"{mem_gb}GB"
 
 
-def _select_model_with_concurrency(models: list, role: str) -> tuple:
-    """Prompt user to select a model and concurrency for a role. Returns (model_name, concurrency, memory)."""
-    print(f"\n\033[1mSelect {role} model:\033[0m")
+def _select_models_for_groups(models: list) -> dict:
+    """Prompt user to select a model for each CE step group. Returns model_config dict."""
+    print("\n\033[1m--- Model Configuration ---\033[0m")
+    print("\nAvailable models:")
     for i, m in enumerate(models, 1):
         print(f"  {i}. {m}")
-    model = None
-    while not model:
-        try:
-            choice = input(f"\n{role} model [1-{len(models)}]: ").strip()
-            idx = int(choice) - 1
-            if 0 <= idx < len(models):
-                model = models[idx]
-        except (ValueError, EOFError):
-            pass
-        if not model:
-            print("Invalid choice, try again.")
 
-    default_conc, default_mem = _estimate_model_defaults(model, role)
+    config = {}
+    last_model = None
 
-    concurrency = default_conc
-    try:
-        c = input(f"Max concurrent requests for {model[:40]}? [{default_conc}]: ").strip()
-        if c:
-            concurrency = max(1, int(c))
-    except (ValueError, EOFError):
-        pass
+    for group_key, group_label, group_desc in MODEL_GROUPS:
+        if last_model:
+            prompt = f"\n\033[1m{group_label}\033[0m ({group_desc})\n  Model [Enter = same as above, or 1-{len(models)}]: "
+        else:
+            prompt = f"\n\033[1m{group_label}\033[0m ({group_desc})\n  Model [1-{len(models)}]: "
 
-    memory = default_mem
-    try:
-        m = input(f"Max model memory for {model[:40]}? [{default_mem}]: ").strip()
-        if m:
-            memory = m
-    except (ValueError, EOFError):
-        pass
+        selected = None
+        while not selected:
+            try:
+                choice = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(0)
 
-    print(f"  -> {model} (concurrency: {concurrency}, memory: {memory})")
-    return model, concurrency, memory
+            if not choice and last_model:
+                selected = last_model
+                break
+
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(models):
+                    selected = models[idx]
+                    break
+            except ValueError:
+                pass
+
+            if last_model:
+                print(f"  Invalid. Enter 1-{len(models)} or press Enter for same model.")
+            else:
+                print(f"  Invalid. Enter 1-{len(models)}.")
+
+        conc, mem = _estimate_model_defaults(selected, group_key)
+        config[group_key] = {"model": selected, "concurrency": conc, "memory": mem}
+        print(f"  -> {selected} (concurrency: {conc}, memory: {mem})")
+        last_model = selected
+
+    return config
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="oMLX Coding Agent")
     parser.add_argument("--repo", default=os.getcwd(), help="Path to git repo (default: cwd)")
-    parser.add_argument("--model", help="Model name (skip dual selection, use for both)")
+    parser.add_argument("--model", help="Model name (skip selection, use for all groups)")
     parser.add_argument("--no-tui", action="store_true", help="Use plain text mode (no curses TUI)")
     args = parser.parse_args()
 
@@ -3066,24 +3109,19 @@ def main():
         sys.exit(1)
 
     if args.model:
+        conc, mem = _estimate_model_defaults(args.model, "work")
         model_config = {
-            "thinking": args.model, "thinking_concurrency": 1,
-            "work": args.model, "work_concurrency": 1,
+            gk: {"model": args.model, "concurrency": conc, "memory": mem}
+            for gk, _, _ in MODEL_GROUPS
         }
     else:
-        print("\n\033[1m--- Model Configuration ---\033[0m")
-        print("Thinking model: used for /ce:ideate, /ce:brainstorm, /ce:plan")
-        print("Work model: used for /ce:work, /ce:review, /ce:compound, /ce:debug, and general chat")
-        t_model, t_conc, t_mem = _select_model_with_concurrency(models, "Thinking")
-        w_model, w_conc, w_mem = _select_model_with_concurrency(models, "Work")
-        model_config = {
-            "thinking": t_model, "thinking_concurrency": t_conc, "thinking_memory": t_mem,
-            "work": w_model, "work_concurrency": w_conc, "work_memory": w_mem,
-        }
+        model_config = _select_models_for_groups(models)
+
     # Set initial settings for the work model (default at startup)
-    startup_settings = {"max_concurrent_requests": model_config["work_concurrency"]}
-    if model_config.get("work_memory"):
-        startup_settings["max_model_memory"] = model_config["work_memory"]
+    work_cfg = model_config["work"]
+    startup_settings = {"max_concurrent_requests": work_cfg.get("concurrency", 1)}
+    if work_cfg.get("memory"):
+        startup_settings["max_model_memory"] = work_cfg["memory"]
     set_omlx_settings(startup_settings)
 
     messages = [
@@ -3114,17 +3152,31 @@ def _main_plain(model_config, messages, models):
     """Original plain-text interface (--no-tui mode)."""
     print(f"\033[1moMLX Coding Agent + Compound Engineering\033[0m")
     print(f"Working directory: {WORK_DIR}")
-    print(f"\nThinking: \033[1;32m{model_config['thinking']}\033[0m")
-    print(f"Work: \033[1;32m{model_config['work']}\033[0m")
+    for gk, gl, _ in MODEL_GROUPS:
+        cfg = model_config[gk]
+        print(f"\n  {gl}: \033[1;32m{cfg['model']}\033[0m (conc: {cfg.get('concurrency', 1)})")
     print("\nType /help for commands. Start typing to chat.")
     print("-" * 60)
 
     active_ce_mode = None
+    _current_model_name = None
 
     def _get_model():
-        if active_ce_mode in THINKING_MODES:
-            return model_config["thinking"]
-        return model_config["work"]
+        group = CE_MODE_TO_GROUP.get(active_ce_mode, "work")
+        return model_config[group]["model"]
+
+    def _ensure_model_plain():
+        nonlocal _current_model_name
+        group = CE_MODE_TO_GROUP.get(active_ce_mode, "work")
+        cfg = model_config[group]
+        new_model = cfg["model"]
+        if _current_model_name and _current_model_name != new_model:
+            unload_omlx_model(_current_model_name)
+            settings = {"max_concurrent_requests": cfg.get("concurrency", 1)}
+            if cfg.get("memory"):
+                settings["max_model_memory"] = cfg["memory"]
+            set_omlx_settings(settings)
+        _current_model_name = new_model
 
     while True:
         try:
@@ -3157,9 +3209,12 @@ def _main_plain(model_config, messages, models):
             print("Conversation, todos, and critical context cleared.")
             continue
         elif user_input == "/status":
-            print(f"Thinking model: {model_config['thinking']}")
-            print(f"Work model: {model_config['work']}")
-            print(f"Active model: {_get_model()}")
+            print("Model assignments:")
+            for gk, gl, _ in MODEL_GROUPS:
+                cfg = model_config[gk]
+                print(f"  {gl}: {cfg['model']} (conc: {cfg.get('concurrency', 1)})")
+            group = CE_MODE_TO_GROUP.get(active_ce_mode, "work")
+            print(f"Active: {_get_model()} [{group}]")
             print(f"Messages: {len(messages)}")
             print(f"Working dir: {WORK_DIR}")
             if active_ce_mode:
@@ -3214,6 +3269,7 @@ def _main_plain(model_config, messages, models):
 
             messages.append({"role": "user", "content": user_content})
             print()
+            _ensure_model_plain()
             response = agent_turn(messages, _get_model())
             ts = datetime.now().strftime("%H:%M:%S")
             print(f"\n[{ts}] \033[1;32mAgent:\033[0m {response}")
@@ -3229,6 +3285,7 @@ def _main_plain(model_config, messages, models):
 
         messages.append({"role": "user", "content": user_input})
         print()
+        _ensure_model_plain()
         response = agent_turn(messages, _get_model())
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"\n[{ts}] \033[1;32mAgent:\033[0m {response}")
