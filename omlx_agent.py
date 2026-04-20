@@ -6,6 +6,7 @@ and Compound Engineering workflows.
 Usage: python3 ~/omlx_agent.py [--repo /path/to/repo]
 """
 
+import base64
 import curses
 import json
 import os
@@ -13,6 +14,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -1958,14 +1960,14 @@ class AgentTUI:
             round_info = f"R:{getattr(self, 'current_round', 0)}"
             activity = getattr(self, '_activity', '') or 'waiting'
             status = f" {round_info} {activity} "
-            hints = "[Tab: Actions | ^C Cancel | ^O Todos]"
+            hints = "[Tab: Actions | ^C Cancel | ^O Todos | ^P Images]"
             bar = f"{status}{hints}"
             color = C_YELLOW
         else:
             mode_tag = f" [{self.active_ce_mode}]" if self.active_ce_mode else ""
             status = f" Ready{mode_tag}  Model: {self.active_model[:40]} "
             nl_hint = "Ret:newline | ^S:submit"
-            hints = f"[{nl_hint} | ^O Todos | ^L Clear | ^D Quit]"
+            hints = f"[{nl_hint} | ^O Todos | ^P Images | ^L Clear | ^D Quit]"
             bar = f"{status}{hints}"
             color = C_GREEN
 
@@ -2066,6 +2068,96 @@ class AgentTUI:
             pass
 
         # ── Action menu popup (over output area, above status bar) ────
+                # ── Image popup (drawn over output pane) ───────────────
+        if self.image_popup_anim_state != "hidden":
+            # Refresh content live
+            anim_h = self.image_popup_anim_height
+            pw = min(self.image_popup_width, w)
+            inner_w = pw - 4
+
+            # Animate
+            if self.image_popup_anim_state == "expanding":
+                step = max(1, self.image_popup_target_height // 5)
+                self.image_popup_anim_height = min(anim_h + step, self.image_popup_target_height)
+                anim_h = self.image_popup_anim_height
+                if anim_h >= self.image_popup_target_height:
+                    self.image_popup_anim_state = "shown"
+                self.needs_redraw = True
+            elif self.image_popup_anim_state == "collapsing":
+                step = max(1, self.image_popup_target_height // 5)
+                self.image_popup_anim_height = max(0, anim_h - step)
+                anim_h = self.image_popup_anim_height
+                if anim_h <= 0:
+                    self.image_popup_anim_state = "hidden"
+                    self._image_view_index = None
+                    self.needs_redraw = True
+                else:
+                    self.needs_redraw = True
+
+            if anim_h > 0 and self.image_popup_anim_state != "hidden":
+                popup_bottom = separator_row
+                popup_top = max(0, popup_bottom - anim_h + 1)
+                actual_h = popup_bottom - popup_top + 1
+                content_rows = actual_h - 2
+
+                # Top border with title
+                title = self.image_popup_title
+                if len(title) > pw - 2:
+                    title = title[:pw - 2]
+                pad_left = (pw - 2 - len(title)) // 2
+                pad_right = pw - 2 - len(title) - pad_left
+                top_border = "+" + "-" * pad_left + title + "-" * pad_right + "+"
+                try:
+                    self.stdscr.addnstr(popup_top, 0, top_border[:pw], pw, curses.color_pair(C_MAGENTA))
+                except curses.error:
+                    pass
+
+                # Content rows
+                if content_rows > 0:
+                    total_lines = len(self.image_popup_lines)
+                    max_scroll = max(0, total_lines - content_rows)
+                    self.image_popup_scroll = max(0, min(self.image_popup_scroll, max_scroll))
+                    can_scroll_up = self.image_popup_scroll > 0
+                    can_scroll_down = (self.image_popup_scroll + content_rows) < total_lines
+
+                    for ci in range(content_rows):
+                        line_idx = self.image_popup_scroll + ci
+                        screen_row = popup_top + 1 + ci
+                        if screen_row >= popup_bottom:
+                            break
+                        if line_idx < total_lines:
+                            text = self.image_popup_lines[line_idx]
+                            color = C_BOLD_GREEN if self._image_view_index == line_idx else C_DEFAULT
+                        else:
+                            text = ""
+                            color = C_DEFAULT
+                        padded = text[:inner_w].ljust(inner_w)
+                        row_str = "| " + padded + " |"
+                        try:
+                            self.stdscr.addnstr(screen_row, 0, row_str[:pw], pw, curses.color_pair(color))
+                            self.stdscr.addnstr(screen_row, 0, "|", 1, curses.color_pair(C_MAGENTA))
+                            self.stdscr.addnstr(screen_row, pw - 1, "|", 1, curses.color_pair(C_MAGENTA))
+                        except curses.error:
+                            pass
+
+                # Bottom border
+                arrow_str = ""
+                if self._image_popup_scrollable and content_rows > 0:
+                    total_lines = len(self.image_popup_lines)
+                    can_up = self.image_popup_scroll > 0
+                    can_dn = (self.image_popup_scroll + content_rows) < total_lines
+                    if can_up and can_dn:
+                        arrow_str = "[^v]"
+                    elif can_up:
+                        arrow_str = "[^ ]"
+                    elif can_dn:
+                        arrow_str = "[ v]"
+                bot_fill = pw - 2 - len(arrow_str)
+                bot_border = "+" + "-" * bot_fill + arrow_str + "+"
+                try:
+                    self.stdscr.addnstr(popup_bottom, 0, bot_border[:pw], pw, curses.color_pair(C_MAGENTA))
+                except curses.error:
+                    pass
         if self.menu_open and self.agent_running:
             menu_w = 50
             menu_h = len(self.menu_items) + 2
@@ -2389,10 +2481,151 @@ class AgentTUI:
                 self.todo_popup_anim_state = "collapsing"
             else:
                 h, w = self.stdscr.getmaxyx()
-                # max popup height = output_height area (rough estimate)
                 max_popup_h = max(4, h - 8)
                 self._open_todo_popup(w, max_popup_h)
             return
+        elif key == 16:  # Ctrl+P -- toggle image popup
+            if self.image_popup_anim_state in ("shown", "expanding"):
+                self.image_popup_anim_state = "collapsing"
+                self._image_view_index = None
+            else:
+                h, w = self.stdscr.getmaxyx()
+                max_popup_h = max(4, h - 8)
+                self._open_image_popup(w, max_popup_h)
+            return
+        elif key == 22:  # Ctrl+V -- paste (check clipboard for image)
+            self._try_paste_image()
+            return
+    # ── Image paste helpers ─────────────────────────────────────────────────
+
+    def _try_paste_image(self):
+        """Try to read an image from the macOS clipboard and save it as a temp file."""
+        try:
+            # Check if clipboard has image data via osascript
+            check = subprocess.run(
+                ["osascript", "-e",
+                 'try\n'
+                 '  set imgData to (the clipboard as TIFF picture)\n'
+                 '  return "yes"\n'
+                 'on error\n'
+                 '  return "no"\n'
+                 'end try'],
+                capture_output=True, text=True, timeout=3
+            )
+            if check.stdout.strip() != "yes":
+                # Not an image -- let the normal paste fall through to text
+                return
+
+            # Save clipboard image to a temp PNG via pngpaste (preferred) or screencapture
+            os.makedirs(os.path.expanduser("~/.omlx/images"), exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            idx = len(self.pasted_images) + 1
+            filename = f"paste-{ts}-{idx}.png"
+            dest = os.path.expanduser(f"~/.omlx/images/{filename}")
+
+            # Try pngpaste first (brew install pngpaste)
+            result = subprocess.run(["pngpaste", dest], capture_output=True)
+            if result.returncode != 0:
+                # Fallback: use osascript to write TIFF then convert
+                tiff_dest = dest.replace(".png", ".tiff")
+                script = (
+                    f'set imgData to (the clipboard as TIFF picture)\n'
+                    f'set f to open for access POSIX file "{tiff_dest}" with write permission\n'
+                    f'write imgData to f\n'
+                    f'close access f'
+                )
+                r2 = subprocess.run(["osascript", "-e", script], capture_output=True)
+                if r2.returncode == 0 and os.path.exists(tiff_dest):
+                    # Convert TIFF to PNG via sips
+                    subprocess.run(["sips", "-s", "format", "png", tiff_dest, "--out", dest],
+                                   capture_output=True)
+                    try:
+                        os.remove(tiff_dest)
+                    except OSError:
+                        pass
+
+            if os.path.exists(dest):
+                self.pasted_images.append({"filename": filename, "path": dest})
+                # Insert a reference tag into the input buffer
+                tag = f"[image:{filename}]"
+                for ch in tag:
+                    self.input_lines[self.input_row].insert(self.input_col, ch)
+                    self.input_col += 1
+                self.add_output(f"[Image pasted: {filename} | Ctrl+P to manage images]", C_MAGENTA)
+                # Refresh popup if open
+                if self.image_popup_anim_state in ("shown", "expanding"):
+                    h, w = self.stdscr.getmaxyx()
+                    self._open_image_popup(w, max(4, h - 8))
+            else:
+                self.add_output("[Image paste failed: could not save PNG]", C_RED)
+        except FileNotFoundError:
+            self.add_output("[Image paste skipped: osascript not available]", C_DIM)
+        except Exception as exc:
+            self.add_output(f"[Image paste error: {exc}]", C_RED)
+
+    def _show_iterm2_image(self, path: str):
+        """Display an image inline using the iTerm2 inline image protocol.
+        Temporarily suspends curses, prints the image, then resumes."""
+        if not os.path.exists(path):
+            self.add_output(f"[Image not found: {path}]", C_RED)
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode()
+            # iTerm2 inline image escape: ESC ] 1337 ; File=... : <base64> BEL
+            iterm_seq = f"\x1b]1337;File=inline=1;width=auto;height=auto;preserveAspectRatio=1:{b64}\x07"
+            # Suspend curses to write raw escape to stdout
+            curses.endwin()
+            sys.stdout.write(iterm_seq + "\n")
+            sys.stdout.flush()
+            # Wait for user to press Enter, then restore
+            sys.stdin.readline()
+            self.stdscr = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            self.stdscr.keypad(True)
+            self.stdscr.nodelay(True)
+            curses.start_color()
+            curses.use_default_colors()
+            self.needs_redraw = True
+        except Exception as exc:
+            self.add_output(f"[iTerm2 preview error: {exc}]", C_RED)
+
+    # ── Image popup helpers ────────────────────────────────────────────────
+    def _get_image_raw_lines(self) -> list:
+        if not self.pasted_images:
+            return ["  No images pasted"]
+        lines = []
+        for i, img in enumerate(self.pasted_images):
+            lines.append(f"  {i+1}. {img['filename']}")
+        return lines
+
+    def _open_image_popup(self, max_w: int, max_h: int):
+        raw = self._get_image_raw_lines()
+        count = len(self.pasted_images)
+        self.image_popup_title = f" Images ({count}) " if count else " Images "
+        max_line_len = max((len(l) for l in raw), default=0)
+        ideal_inner = max(max_line_len, len(self.image_popup_title))
+        inner_w = min(ideal_inner, max_w - 4)
+        inner_w = max(inner_w, 10)
+        self.image_popup_width = inner_w + 4
+        self.image_popup_lines = []
+        for line in raw:
+            if len(line) <= inner_w:
+                self.image_popup_lines.append(line)
+            else:
+                chunks = textwrap.wrap(line, inner_w, subsequent_indent="       ", break_long_words=True, break_on_hyphens=False)
+                self.image_popup_lines.extend(chunks if chunks else [line[:inner_w]])
+        content_h = len(self.image_popup_lines)
+        ideal_h = content_h + 2
+        self.image_popup_target_height = min(ideal_h, max_h)
+        self._image_popup_scrollable = content_h > (self.image_popup_target_height - 2)
+        self.image_popup_scroll = 0
+        self.image_popup_anim_state = "expanding"
+        self.image_popup_anim_height = 1
+        self._image_view_index = None
+        self.needs_redraw = True
 
         # --- Escape: record time for Alt+Enter detection ---
         if key == 27:
@@ -2441,8 +2674,16 @@ class AgentTUI:
             self.input_col = len(self.input_lines[self.input_row])
             return
 
-        # --- Up / Down: todo popup scroll takes priority ---
-        if self.todo_popup_anim_state == "shown" and self._todo_popup_scrollable:
+        # --- Up / Down: popup scroll takes priority ---
+        if self.image_popup_anim_state == "shown" and self._image_popup_scrollable:
+            if key == curses.KEY_UP:
+                self.image_popup_scroll = max(0, self.image_popup_scroll - 1)
+                return
+            if key == curses.KEY_DOWN:
+                self.image_popup_scroll += 1
+                self.needs_redraw = True
+                return
+        elif self.todo_popup_anim_state == "shown" and self._todo_popup_scrollable:
             if key == curses.KEY_UP:
                 self.todo_popup_scroll = max(0, self.todo_popup_scroll - 1)
                 return
@@ -2450,6 +2691,35 @@ class AgentTUI:
                 self.todo_popup_scroll += 1
                 self.needs_redraw = True
                 return
+
+        # --- Image popup navigation ---
+        if self.image_popup_anim_state == "shown":
+            # Up/Down to move selection
+            if key == curses.KEY_UP:
+                if self._image_view_index is None:
+                    self._image_view_index = 0
+                else:
+                    self._image_view_index = max(0, self._image_view_index - 1)
+                self.needs_redraw = True
+                return
+            elif key == curses.KEY_DOWN:
+                if self._image_view_index is None:
+                    self._image_view_index = 0
+                else:
+                    self._image_view_index = min(len(self.pasted_images) - 1, self._image_view_index + 1)
+                self.needs_redraw = True
+                return
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if self._image_view_index is not None and self._image_view_index < len(self.pasted_images):
+                    img = self.pasted_images[self._image_view_index]
+                    self._show_iterm2_image(img["path"])
+                return
+            elif key == 27 or key == 9:
+                self.image_popup_anim_state = "collapsing"
+                self._image_view_index = None
+                return
+
+
 
         # --- Up / Down: navigate within lines first, then history ---
         if key == curses.KEY_UP:
@@ -2657,22 +2927,66 @@ class AgentTUI:
             self.add_output(f"--- Entering {ce_cmd.upper()} mode ---", C_MAGENTA)
 
             if ce_extra:
-                user_content = ce_extra
+                raw_content = ce_extra
             else:
                 defaults = {
                     "review": "Review the current changes in this branch.",
                     "compound": "Document learnings from the recent work.",
                     "ideate": "Analyze this project and suggest improvements.",
                 }
-                user_content = defaults.get(ce_cmd, f"I am ready to {ce_cmd}. What should we work on?")
+                raw_content = defaults.get(ce_cmd, f"I am ready to {ce_cmd}. What should we work on?")
 
-            self.messages.append({"role": "user", "content": user_content})
+            self.messages.append({"role": "user", "content": self._build_user_content(raw_content)})
             self._run_agent_async()
             return
 
-        # Normal message
-        self.messages.append({"role": "user", "content": text})
+        # Normal message -- attach any [image:filename] references as multimodal content
+        user_content = self._build_user_content(text)
+        self.messages.append({"role": "user", "content": user_content})
         self._run_agent_async()
+
+    def _build_user_content(self, text: str):
+        """Build message content, embedding any [image:filename] tags as base64 image parts."""
+        # Find all image tags in the text
+        image_refs = re.findall(r'\[image:([^\]]+)\]', text)
+        if not image_refs:
+            return text
+
+        # Build multimodal content list
+        parts = []
+        # Split text at image tags and interleave with image parts
+        segments = re.split(r'\[image:[^\]]+\]', text)
+        for i, seg in enumerate(segments):
+            if seg.strip():
+                parts.append({"type": "text", "text": seg})
+            if i < len(image_refs):
+                ref = image_refs[i]
+                # Look up the path from pasted_images
+                img_path = None
+                for img in self.pasted_images:
+                    if img["filename"] == ref:
+                        img_path = img["path"]
+                        break
+                if img_path and os.path.exists(img_path):
+                    try:
+                        with open(img_path, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode()
+                        ext = os.path.splitext(img_path)[1].lstrip(".").lower() or "png"
+                        mime = f"image/{ext}" if ext in ("png", "jpg", "jpeg", "gif", "webp") else "image/png"
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"}
+                        })
+                    except Exception:
+                        parts.append({"type": "text", "text": f"[image: {ref} (failed to load)]"})
+                else:
+                    parts.append({"type": "text", "text": f"[image: {ref} (not found)]"})
+
+        # If only one text segment and no images loaded, return plain string
+        if all(p["type"] == "text" for p in parts):
+            return "\n".join(p["text"] for p in parts if p["text"].strip())
+
+        return parts
 
     def _handle_model_switch(self):
         """Show model list; user types a group prefix + model number to switch."""
