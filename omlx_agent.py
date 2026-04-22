@@ -333,6 +333,7 @@ class CEWorkflowState:
     manager_messages: list = field(default_factory=list)
     manager_failures: int = 0
     phase_failures: int = 0
+    rejected_completions: int = 0
 
 
 MANAGER_SYSTEM_PROMPT = """You are the Compound Engineering manager layer for a coding agent.
@@ -585,6 +586,143 @@ def _manager_autorecover_decision(workflow_state: CEWorkflowState, raw_text: str
         "phase_input": _failsafe_phase_input(phase, workflow_state.objective, artifacts),
         "reason": "Autorecover from manager failure",
     }
+
+
+_IMPLEMENTATION_VERBS = (
+    "implement", "build", "code", "write", "add", "create", "fix",
+    "refactor", "ship", "deploy", "wire", "integrate", "develop",
+    "make ", "update the code", "modify the code", "change the code",
+    "work on", "execute",
+)
+
+_PLANNING_ONLY_VERBS = (
+    "brainstorm", "ideate", "explore", "research", "draft a plan",
+    "write a plan", "outline", "design doc", "discuss",
+)
+
+
+def _objective_requires_implementation(objective: str) -> bool:
+    text = (objective or "").lower()
+    if not text:
+        return False
+    if any(v in text for v in _PLANNING_ONLY_VERBS) and not any(
+        v in text for v in ("then implement", "then build", "then work", "then ship")
+    ):
+        # Planning-only intent overrides implementation verbs UNLESS chained.
+        if not any(f" {v}" in f" {text}" for v in ("implement", "build", "ship", "deploy", "fix")):
+            return False
+    return any(v in text for v in _IMPLEMENTATION_VERBS)
+
+
+def _deterministic_completion_block(workflow_state: CEWorkflowState) -> dict | None:
+    """Return an override decision if the manager's 'complete' is premature.
+
+    Compares the original objective against completed_phases and produces a
+    run_phase decision that nudges the flow back on track.
+    """
+    completed = set(workflow_state.completed_phases)
+    artifacts = _workflow_artifact_snapshot()
+    objective = workflow_state.objective or ""
+    needs_impl = _objective_requires_implementation(objective)
+
+    next_phase: str | None = None
+    reason = ""
+    if needs_impl and "work" not in completed:
+        if not artifacts.get("plan") and "plan" not in completed:
+            next_phase = "plan"
+            reason = "Objective requires implementation but no plan exists yet."
+        elif "deepen_plan" not in completed:
+            next_phase = "deepen_plan"
+            reason = "Objective requires implementation; deepen the plan before working."
+        else:
+            next_phase = "work"
+            reason = "Objective requires implementation but the work phase has not run."
+    elif needs_impl and "work" in completed and "review" not in completed:
+        next_phase = "review"
+        reason = "Work completed but no review phase has run."
+
+    if not next_phase:
+        return None
+
+    phase_input = _failsafe_phase_input(next_phase, objective, artifacts)
+    return {
+        "action": "run_phase",
+        "phase": next_phase,
+        "message": f"Completion rejected: {reason} Resuming with {next_phase}.",
+        "question": "",
+        "phase_input": phase_input,
+        "reason": reason,
+    }
+
+
+_COMPLETION_VERIFY_PROMPT = (
+    "You are verifying whether the managed Compound Engineering flow has actually "
+    "satisfied the user's original objective.\n\n"
+    "Original user objective:\n{objective}\n\n"
+    "Completed phases: {completed}\n"
+    "Workflow artifacts:\n{artifacts}\n\n"
+    "Manager's proposed final summary:\n{final_message}\n\n"
+    "Compare the proposed summary against the original objective. Did the flow actually "
+    "do what the user asked, including any required implementation work, or did it stop "
+    "after only producing planning artifacts when the user wanted real changes?\n\n"
+    "Reply with JSON only using this schema:\n"
+    "{{\n"
+    '  "verdict": "complete" | "incomplete",\n'
+    '  "missing": "what is still missing if incomplete, else empty string",\n'
+    '  "next_phase": "brainstorm|plan|deepen_plan|work|review|compound or empty",\n'
+    '  "next_phase_input": "instruction for the next phase, or empty"\n'
+    "}}"
+)
+
+
+def _parse_completion_verdict(text: str) -> dict | None:
+    candidate = _extract_first_json_object(text)
+    if not candidate:
+        return None
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    verdict = (data.get("verdict") or "").strip().lower()
+    if verdict not in {"complete", "incomplete"}:
+        return None
+    return {
+        "verdict": verdict,
+        "missing": (data.get("missing") or "").strip(),
+        "next_phase": (data.get("next_phase") or "").strip(),
+        "next_phase_input": (data.get("next_phase_input") or "").strip(),
+    }
+
+
+def run_completion_verifier(workflow_state: CEWorkflowState, final_message: str, model: str) -> dict | None:
+    """Ask the manager model to confirm the work matches the original objective."""
+    artifacts = _format_workflow_artifacts()
+    completed = ", ".join(workflow_state.completed_phases) or "none"
+    prompt = _COMPLETION_VERIFY_PROMPT.format(
+        objective=workflow_state.objective or "(no objective recorded)",
+        completed=completed,
+        artifacts=artifacts,
+        final_message=final_message or "(no final message)",
+    )
+    messages = [
+        {"role": "system", "content": "You are a strict completion auditor. Output JSON only."},
+        {"role": "user", "content": prompt},
+    ]
+    for _ in range(3):
+        response = api_call(messages, model)
+        if not response:
+            return None
+        parsed = normalize_api_response(response)
+        text = parsed.get("text") or ""
+        verdict = _parse_completion_verdict(text)
+        if verdict:
+            return verdict
+        messages.append({"role": "assistant", "content": text})
+        messages.append({
+            "role": "user",
+            "content": "Reply with valid JSON only using the required schema.",
+        })
+    return None
 
 
 def _build_manager_handoff(manager_messages: list, phase: str, phase_input: str) -> str:
@@ -3719,6 +3857,62 @@ class AgentTUI:
             })
         return decision
 
+    def _verify_managed_completion(self, decision: dict) -> dict | None:
+        """Validate a manager 'complete' decision against the original objective.
+
+        Returns an override decision (action=run_phase) if the flow has not
+        actually finished the user's request. Returns None to accept completion.
+        """
+        # Cap the number of completion rejections so we cannot loop forever.
+        if self.workflow_state.rejected_completions >= 3:
+            return None
+
+        deterministic = _deterministic_completion_block(self.workflow_state)
+        if deterministic is not None:
+            return deterministic
+
+        manager_model = self.model_groups["manager"]["model"]
+        # Make sure the manager model is loaded for the verifier turn.
+        if self._current_model_name != manager_model:
+            unload_omlx_model(self._current_model_name) if self._current_model_name else None
+            self._current_group = None
+            self._current_model_name = None
+            saved_mode = self.active_ce_mode
+            self.active_ce_mode = "flow"
+            self._ensure_model()
+            self.active_ce_mode = saved_mode or "flow"
+
+        verdict = run_completion_verifier(
+            self.workflow_state, decision.get("message", ""), manager_model
+        )
+        if not verdict or verdict["verdict"] == "complete":
+            return None
+
+        artifacts = _workflow_artifact_snapshot()
+        next_phase = verdict.get("next_phase") or ""
+        valid_phases = {"brainstorm", "plan", "deepen_plan", "work", "review", "compound"}
+        if next_phase not in valid_phases:
+            # Fall back to deterministic next-phase picker.
+            fallback = _manager_autorecover_decision(self.workflow_state, "completion verifier did not specify next phase")
+            if fallback.get("action") != "run_phase":
+                return None
+            next_phase = fallback["phase"]
+            phase_input = fallback["phase_input"]
+        else:
+            phase_input = verdict.get("next_phase_input") or _failsafe_phase_input(
+                next_phase, self.workflow_state.objective, artifacts
+            )
+
+        missing = verdict.get("missing") or "objective not yet satisfied"
+        return {
+            "action": "run_phase",
+            "phase": next_phase,
+            "message": f"Completion rejected by verifier: {missing}",
+            "question": "",
+            "phase_input": phase_input,
+            "reason": missing,
+        }
+
     def _run_phase_from_flow(self, phase: str, phase_input: str) -> str:
         actual_phase = "plan" if phase == "deepen_plan" else phase
         mode_prompt = CE_PROMPTS[actual_phase]
@@ -3760,18 +3954,37 @@ class AgentTUI:
             decision = self._run_workflow_manager_turn()
             action = decision["action"]
 
+            if action == "complete":
+                override = self._verify_managed_completion(decision)
+                if override is not None:
+                    decision = override
+                    action = override["action"]
+                    self.workflow_state.rejected_completions += 1
+                    self.workflow_state.manager_messages.append({
+                        "role": "user",
+                        "content": (
+                            "[Completion verifier rejected]\n"
+                            f"Reason: {override.get('reason', '')}\n"
+                            f"Resuming with phase: {override.get('phase', '')}."
+                        ),
+                    })
+                    self.add_output(
+                        f"[Manager] Completion rejected: {override.get('reason', '')}",
+                        C_YELLOW,
+                    )
+                else:
+                    self.workflow_state.active = False
+                    self.workflow_state.awaiting_user = False
+                    self.workflow_state.pending_question = ""
+                    self.active_ce_mode = None
+                    return decision["message"] or "Managed Compound Engineering flow complete."
+
             if action == "ask_user":
+                # Re-check in case override produced a question (it shouldn't, but be safe)
                 question = decision["question"] or decision["message"] or "What should I clarify before continuing?"
                 self.workflow_state.awaiting_user = True
                 self.workflow_state.pending_question = question
                 return question
-
-            if action == "complete":
-                self.workflow_state.active = False
-                self.workflow_state.awaiting_user = False
-                self.workflow_state.pending_question = ""
-                self.active_ce_mode = None
-                return decision["message"] or "Managed Compound Engineering flow complete."
 
             phase = decision["phase"]
             status = decision["message"] or decision["reason"] or f"Running {phase}"
@@ -4317,6 +4530,45 @@ def _main_plain(model_config, messages, models):
         del messages[start_idx:start_idx + 2]
         return result
 
+    def _verify_plain_completion(workflow_state: CEWorkflowState, decision: dict) -> dict | None:
+        nonlocal active_ce_mode, _current_model_name
+        if workflow_state.rejected_completions >= 3:
+            return None
+        deterministic = _deterministic_completion_block(workflow_state)
+        if deterministic is not None:
+            return deterministic
+        manager_model = model_config["manager"]["model"]
+        if _current_model_name and _current_model_name != manager_model:
+            unload_omlx_model(_current_model_name)
+            _current_model_name = None
+        active_ce_mode = "flow"
+        _ensure_model_plain()
+        verdict = run_completion_verifier(workflow_state, decision.get("message", ""), manager_model)
+        if not verdict or verdict["verdict"] == "complete":
+            return None
+        artifacts = _workflow_artifact_snapshot()
+        next_phase = verdict.get("next_phase") or ""
+        valid_phases = {"brainstorm", "plan", "deepen_plan", "work", "review", "compound"}
+        if next_phase not in valid_phases:
+            fallback = _manager_autorecover_decision(workflow_state, "completion verifier did not specify next phase")
+            if fallback.get("action") != "run_phase":
+                return None
+            next_phase = fallback["phase"]
+            phase_input = fallback["phase_input"]
+        else:
+            phase_input = verdict.get("next_phase_input") or _failsafe_phase_input(
+                next_phase, workflow_state.objective, artifacts
+            )
+        missing = verdict.get("missing") or "objective not yet satisfied"
+        return {
+            "action": "run_phase",
+            "phase": next_phase,
+            "message": f"Completion rejected by verifier: {missing}",
+            "question": "",
+            "phase_input": phase_input,
+            "reason": missing,
+        }
+
     while True:
         try:
             if active_ce_mode:
@@ -4410,16 +4662,30 @@ def _main_plain(model_config, messages, models):
                         "role": "user",
                         "content": f"[Manager autorecovery triggered] {decision['message']}",
                     })
+                if decision["action"] == "complete":
+                    override = _verify_plain_completion(workflow_state, decision)
+                    if override is not None:
+                        decision = override
+                        workflow_state.rejected_completions += 1
+                        workflow_state.manager_messages.append({
+                            "role": "user",
+                            "content": (
+                                "[Completion verifier rejected]\n"
+                                f"Reason: {override.get('reason', '')}\n"
+                                f"Resuming with phase: {override.get('phase', '')}."
+                            ),
+                        })
+                        print(f"\n[Manager] Completion rejected: {override.get('reason', '')}")
+                    else:
+                        workflow_state.active = False
+                        workflow_state.awaiting_user = False
+                        active_ce_mode = None
+                        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['message'] or 'Managed Compound Engineering flow complete.'}")
+                        break
                 if decision["action"] == "ask_user":
                     workflow_state.awaiting_user = True
                     workflow_state.pending_question = decision["question"]
                     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['question']}")
-                    break
-                if decision["action"] == "complete":
-                    workflow_state.active = False
-                    workflow_state.awaiting_user = False
-                    active_ce_mode = None
-                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['message'] or 'Managed Compound Engineering flow complete.'}")
                     break
 
                 phase = decision["phase"]
@@ -4481,16 +4747,30 @@ def _main_plain(model_config, messages, models):
                         "role": "user",
                         "content": f"[Manager autorecovery triggered] {decision['message']}",
                     })
+                if decision["action"] == "complete":
+                    override = _verify_plain_completion(workflow_state, decision)
+                    if override is not None:
+                        decision = override
+                        workflow_state.rejected_completions += 1
+                        workflow_state.manager_messages.append({
+                            "role": "user",
+                            "content": (
+                                "[Completion verifier rejected]\n"
+                                f"Reason: {override.get('reason', '')}\n"
+                                f"Resuming with phase: {override.get('phase', '')}."
+                            ),
+                        })
+                        print(f"\n[Manager] Completion rejected: {override.get('reason', '')}")
+                    else:
+                        workflow_state.active = False
+                        workflow_state.awaiting_user = False
+                        active_ce_mode = None
+                        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['message'] or 'Managed Compound Engineering flow complete.'}")
+                        break
                 if decision["action"] == "ask_user":
                     workflow_state.awaiting_user = True
                     workflow_state.pending_question = decision["question"]
                     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['question']}")
-                    break
-                if decision["action"] == "complete":
-                    workflow_state.active = False
-                    workflow_state.awaiting_user = False
-                    active_ce_mode = None
-                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['message'] or 'Managed Compound Engineering flow complete.'}")
                     break
                 phase = decision["phase"]
                 phase_succeeded = True
