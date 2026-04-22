@@ -24,9 +24,13 @@ python3 omlx_agent.py --model my-model-name
 python3 omlx_agent.py --no-tui
 ```
 
-On launch you pick two models:
-- **Thinking model** -- used for brainstorm, plan, and ideate modes
-- **Work model** -- used for work, review, compound, debug, and general chat
+On launch you pick models for each workflow layer:
+- **Manager model** -- orchestrates `/ce:flow`, asks the user blocking questions, and decides the next Compound Engineering phase
+- **Ideate/Brainstorm model** -- used for brainstorm and ideate phases
+- **Planning model** -- used for plan generation and plan deepening
+- **Work model** -- used for implementation, debug, and general chat
+- **Review model** -- used for review passes
+- **Compound model** -- used for solution and learning capture
 
 The agent auto-configures oMLX concurrency and memory settings per model.
 
@@ -72,6 +76,7 @@ Enter a mode with `/ce:<mode>` and exit with `/ce:done`. Each mode has a structu
 
 | Command | Mode | Purpose |
 |---|---|---|
+| `/ce:flow` | Flow Manager | Run brainstorm and/or plan, deepen the plan, then automatically run work, review, and compound while pausing only for real user questions |
 | `/ce:brainstorm` | Brainstorm | Explore requirements, propose approaches, save a requirements doc |
 | `/ce:plan` | Plan | Create a step-by-step implementation plan with checkboxes |
 | `/ce:work` | Work | Execute the plan step by step, marking progress as you go |
@@ -82,13 +87,15 @@ Enter a mode with `/ce:<mode>` and exit with `/ce:done`. Each mode has a structu
 
 **Resumability**: Plans and reviews use checkbox format (`[ ]` / `[x]`). The agent marks steps complete via `ce_mark_step` as it goes, so interrupted sessions can resume where they left off.
 
+**Managed flow orchestration**: `/ce:flow` runs on a dedicated manager model. The manager model is unloaded before each specialist phase model is loaded, and the current manager context is passed into the phase as a structured handoff. That keeps orchestration separate from implementation while still giving each phase the context it needs.
+
 **Learnings file**: All modes read `compound-engineering.local.md` at the start of non-trivial tasks. The compound mode keeps it updated as the single source of truth for project knowledge -- patterns, gotchas, root causes, and solutions extracted from past work.
 
 **Document storage**: CE documents (brainstorms, plans, reviews, solutions, todos) are saved to `docs/` or `referenceDocs/` subdirectories with auto-generated dated filenames.
 
 ### Context Management
 
-- **Dual model support**: Thinking-heavy modes (brainstorm, plan, ideate) use one model; execution modes (work, review, compound, debug) use another. Concurrency and memory limits are switched automatically.
+- **Multi-model workflow support**: The manager and each major CE phase can use different models. Concurrency and memory limits are switched automatically, and the manager model is explicitly unloaded before specialist phase models are loaded during `/ce:flow`.
 - **Emergency trim**: When the context window fills up, the agent drops the oldest non-system messages and retries automatically.
 - **Auto-continue**: If generation hits the token limit mid-response, the agent prompts the model to continue where it left off.
 - **Learnings preloaded**: The first 3000 chars of `compound-engineering.local.md` are injected as a system message at startup.

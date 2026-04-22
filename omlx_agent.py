@@ -20,7 +20,9 @@ import textwrap
 import threading
 import time
 import urllib.request
+import urllib.parse
 from datetime import datetime
+from dataclasses import dataclass, field
 
 API_URL = "http://localhost:8000/v1"
 API_KEY = os.environ.get("OMLX_API_KEY", "omlx-80ktncu2cdui9fal")
@@ -313,6 +315,303 @@ TOOLS = [
 
 WORK_DIR = os.getcwd()
 SESSION_TODOS = []
+SESSION_DOCS = {
+    "brainstorm": None,
+    "plan": None,
+    "review": None,
+    "solution": None,
+}
+
+
+@dataclass
+class CEWorkflowState:
+    active: bool = False
+    awaiting_user: bool = False
+    objective: str = ""
+    pending_question: str = ""
+    completed_phases: list[str] = field(default_factory=list)
+    manager_messages: list = field(default_factory=list)
+    manager_failures: int = 0
+    phase_failures: int = 0
+
+
+MANAGER_SYSTEM_PROMPT = """You are the Compound Engineering manager layer for a coding agent.
+
+You do not implement code directly. You orchestrate the workflow across specialist phases and pause only when the user must answer a real question.
+
+Responsibilities:
+- Decide whether to run brainstorm, plan, deepen_plan, work, review, or compound next.
+- Ask the user one concise question at a time only when requirements, scope, approvals, or missing decisions block progress.
+- Keep actual implementation confined to the work phase.
+- Treat brainstorm, plan, deepen_plan, review, and compound as non-implementation phases. They may read and write planning, review, and solution artifacts, but they must not change product code.
+- Once enough information exists, move forward without waiting for the user: brainstorm if needed, then plan, then deepen_plan, then work, then review, then compound.
+- Prefer reusing existing brainstorms or plans when they already fit the request.
+
+Return JSON only with this schema:
+{
+  "action": "ask_user" | "run_phase" | "complete",
+  "phase": "brainstorm" | "plan" | "deepen_plan" | "work" | "review" | "compound" | "",
+  "message": "short status or completion summary",
+  "question": "question for the user when action=ask_user",
+  "phase_input": "the exact instruction to send to the specialist phase when action=run_phase",
+  "reason": "brief explanation for why this is the right next step"
+}
+
+Rules:
+- action=ask_user: set question, leave phase empty, leave phase_input empty.
+- action=run_phase: set phase and phase_input. question must be empty.
+- action=complete: give a short final summary in message.
+- Never choose work before a plan exists and has been deepened.
+- Never choose review before work.
+- Never choose compound before review.
+- When deciding between brainstorm and plan, choose brainstorm if user-facing behavior or scope is still unclear. Otherwise choose plan.
+- Output valid JSON only. No markdown fences or commentary outside the JSON object.
+"""
+
+
+def _reset_session_docs():
+    for key in SESSION_DOCS:
+        SESSION_DOCS[key] = None
+
+
+def _set_session_doc(doc_type: str, rel_path: str):
+    if doc_type in SESSION_DOCS:
+        SESSION_DOCS[doc_type] = rel_path
+
+
+def _get_latest_ce_doc(subdir: str) -> str | None:
+    newest_path = None
+    newest_mtime = -1.0
+    for parent in ["docs", "referenceDocs"]:
+        root = resolve(os.path.join(parent, subdir))
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.endswith(".md"):
+                    continue
+                full = os.path.join(dirpath, filename)
+                try:
+                    mtime = os.path.getmtime(full)
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_path = os.path.relpath(full, WORK_DIR)
+    return newest_path
+
+
+def _workflow_artifact_snapshot() -> dict:
+    return {
+        "brainstorm": SESSION_DOCS.get("brainstorm") or _get_latest_ce_doc("brainstorms"),
+        "plan": SESSION_DOCS.get("plan") or _get_latest_ce_doc("plans"),
+        "review": SESSION_DOCS.get("review") or _get_latest_ce_doc("reviews"),
+        "solution": SESSION_DOCS.get("solution") or _get_latest_ce_doc("solutions"),
+    }
+
+
+def _format_workflow_artifacts() -> str:
+    artifacts = _workflow_artifact_snapshot()
+    lines = []
+    for key in ["brainstorm", "plan", "review", "solution"]:
+        lines.append(f"- {key}: {artifacts.get(key) or 'none'}")
+    return "\n".join(lines)
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    # Common case: fenced JSON block
+    fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+    if fence:
+        return fence.group(1)
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    # Extract the first balanced {...} candidate
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
+def _parse_manager_decision(text: str) -> dict | None:
+    candidate = _extract_first_json_object(text)
+    if not candidate:
+        return None
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    action = data.get("action")
+    if action not in {"ask_user", "run_phase", "complete"}:
+        return None
+    phase = data.get("phase", "") or ""
+    if action == "run_phase" and phase not in {"brainstorm", "plan", "deepen_plan", "work", "review", "compound"}:
+        return None
+    if action == "ask_user" and not (data.get("question") or "").strip():
+        return None
+    if action == "run_phase" and not (data.get("phase_input") or "").strip():
+        return None
+    return {
+        "action": action,
+        "phase": phase,
+        "message": (data.get("message") or "").strip(),
+        "question": (data.get("question") or "").strip(),
+        "phase_input": (data.get("phase_input") or "").strip(),
+        "reason": (data.get("reason") or "").strip(),
+    }
+
+
+def run_manager_turn(manager_messages: list, model: str) -> tuple[dict | None, str]:
+    last_detail = ""
+    for _ in range(4):
+        response = api_call(manager_messages, model)
+        if not response:
+            return None, "[Manager API call failed]"
+        parsed = normalize_api_response(response)
+        text = parsed.get("text") or ""
+        last_detail = text or parsed.get("error") or ""
+
+        if parsed.get("tool_calls"):
+            manager_messages.append({
+                "role": "user",
+                "content": "Do not call tools in manager mode. Return only a JSON orchestration decision.",
+            })
+            continue
+
+        if _is_retryable_empty_response(parsed, manager_messages):
+            manager_messages.append({
+                "role": "user",
+                "content": "Your last reply was empty or unparsable. Return one valid JSON decision now.",
+            })
+            continue
+
+        decision = _parse_manager_decision(text)
+        if text:
+            manager_messages.append({"role": "assistant", "content": text})
+        if decision:
+            return decision, text
+        manager_messages.append({
+            "role": "user",
+            "content": "Your previous response was invalid. Reply with valid JSON only using the required schema.",
+        })
+    return None, (last_detail or "[Manager response invalid]")
+
+
+def _manager_fallback_decision(raw_text: str) -> dict:
+    snippet = (raw_text or "").strip().replace("\n", " ")
+    if len(snippet) > 240:
+        snippet = snippet[:240] + "..."
+    question = "I could not parse the manager decision. Reply 'retry' to continue, or restate your objective in one sentence."
+    if snippet:
+        question = f"I could not parse the manager decision ({snippet}). Reply 'retry' to continue, or restate your objective in one sentence."
+    return {
+        "action": "ask_user",
+        "phase": "",
+        "message": "Manager response was invalid.",
+        "question": question,
+        "phase_input": "",
+        "reason": "Fallback recovery",
+    }
+
+
+def _failsafe_phase_input(phase: str, objective: str, artifacts: dict) -> str:
+    plan_path = artifacts.get("plan") or ""
+    if phase == "brainstorm":
+        return f"Managed failsafe: run a focused brainstorm for this objective and save requirements. Objective: {objective}"
+    if phase == "plan":
+        return f"Managed failsafe: create a concrete implementation plan from this objective. Objective: {objective}"
+    if phase == "deepen_plan":
+        if plan_path:
+            return f"Managed failsafe: deepen this existing plan before work: {plan_path}"
+        return "Managed failsafe: deepen the most relevant active plan before work."
+    if phase == "work":
+        if plan_path:
+            return f"Managed failsafe: execute work from this plan: {plan_path}"
+        return f"Managed failsafe: execute the objective directly and maintain todos. Objective: {objective}"
+    if phase == "review":
+        return "Managed failsafe: review the changes produced by the work phase and capture prioritized findings."
+    if phase == "compound":
+        return "Managed failsafe: document learnings and solution notes from this completed workflow."
+    return objective
+
+
+def _manager_autorecover_decision(workflow_state: CEWorkflowState, raw_text: str) -> dict:
+    artifacts = _workflow_artifact_snapshot()
+    completed = set(workflow_state.completed_phases)
+    plan_ready = bool(artifacts.get("plan") or "plan" in completed)
+
+    if not plan_ready:
+        phase = "brainstorm" if "brainstorm" not in completed else "plan"
+    elif "deepen_plan" not in completed:
+        phase = "deepen_plan"
+    elif "work" not in completed:
+        phase = "work"
+    elif "review" not in completed:
+        phase = "review"
+    elif "compound" not in completed:
+        phase = "compound"
+    else:
+        return {
+            "action": "complete",
+            "phase": "",
+            "message": "Managed flow completed via failsafe sequencing.",
+            "question": "",
+            "phase_input": "",
+            "reason": "All phases complete",
+        }
+
+    snippet = (raw_text or "").strip().replace("\n", " ")
+    if len(snippet) > 220:
+        snippet = snippet[:220] + "..."
+    msg = f"Manager autorecovery engaged: running {phase}."
+    if snippet:
+        msg += f" Last manager error: {snippet}"
+    return {
+        "action": "run_phase",
+        "phase": phase,
+        "message": msg,
+        "question": "",
+        "phase_input": _failsafe_phase_input(phase, workflow_state.objective, artifacts),
+        "reason": "Autorecover from manager failure",
+    }
+
+
+def _build_manager_handoff(manager_messages: list, phase: str, phase_input: str) -> str:
+    phase_label = "plan (deepening pass)" if phase == "deepen_plan" else phase
+    recent_messages = manager_messages[-6:]
+    lines = [
+        "[FLOW manager handoff]",
+        f"Target phase: {phase_label}",
+        "Use this as orchestration context from the manager layer. Execute the phase normally, but honor this handoff.",
+        "",
+        "Recent manager context:",
+    ]
+    for message in recent_messages:
+        role = message.get("role", "unknown")
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = json.dumps(content)
+        content = str(content).strip()
+        if len(content) > 700:
+            content = content[:700] + "..."
+        lines.append(f"- {role}: {content}")
+    lines.extend([
+        "",
+        "Manager instruction for this phase:",
+        phase_input,
+    ])
+    return "\n".join(lines)
 
 
 def set_work_dir(path: str):
@@ -622,6 +921,7 @@ def tool_ce_create_plan(action: str, name: str = None, content: str = None) -> s
         with open(path, "w") as f:
             f.write(content)
         rel = os.path.relpath(path, WORK_DIR)
+        _set_session_doc("plan", rel)
         return f"Plan created: {rel}"
     return f"ERROR: unknown action '{action}'"
 
@@ -648,6 +948,7 @@ def tool_ce_save_doc(doc_type: str, content: str, name: str = None) -> str:
     with open(path, "w") as f:
         f.write(content)
     rel = os.path.relpath(path, WORK_DIR)
+    _set_session_doc(doc_type, rel)
 
     # R4: Update temp file indexes when a solution is saved
     if doc_type == "solution":
@@ -963,6 +1264,12 @@ If no solutions directory exists, skip the pipeline entirely.
 
 RESUMABILITY: Always use ce_mark_step to check off completed steps in the plan file as you finish each one. This way, if the session is interrupted, the next /ce:work invocation will see which steps are already done and resume from where you left off.
 
+CRITICAL RULE -- TOOL USE IS MANDATORY:
+You must use tools to make every change. NEVER show code in a message and ask the user to add it themselves.
+NEVER write "Add this to...", "Insert the following...", "Here is the code to add...", "You should add...", "The change needed is..."
+If you need to edit a file, call replace_in_file or write_file RIGHT NOW. No narration, no explanation first.
+If you catch yourself writing markdown code blocks as instructions to the user, STOP and make the tool call instead.
+
 Guidelines:
 - One task at a time, verify before moving on
 - Use replace_in_file for surgical edits, write_file for new files
@@ -1193,10 +1500,11 @@ def unload_omlx_model(model_name: str) -> bool:
         _p(f"[Warning: Could not login to admin API for model unload]", C_YELLOW if _tui_instance else 0)
         return False
     try:
-        payload = json.dumps({"model": model_name}).encode("utf-8")
+        # oMLX admin API: POST /admin/api/models/{model_id}/unload (model_id in path, not body)
+        encoded_model = urllib.parse.quote(model_name, safe="")
         req = urllib.request.Request(
-            f"{API_URL.replace('/v1', '')}/admin/api/model/unload",
-            data=payload,
+            f"{API_URL.replace('/v1', '')}/admin/api/models/{encoded_model}/unload",
+            data=b"",
             headers={
                 "Content-Type": "application/json",
                 "Cookie": f"omlx_admin_session={cookie}",
@@ -1217,6 +1525,7 @@ def unload_omlx_model(model_name: str) -> bool:
 
 # Map each CE mode to its model group
 CE_MODE_TO_GROUP = {
+    "flow": "manager",
     "ideate": "ideate_brainstorm",
     "brainstorm": "ideate_brainstorm",
     "plan": "plan",
@@ -1228,6 +1537,7 @@ CE_MODE_TO_GROUP = {
 
 # Ordered list of model groups for startup selection
 MODEL_GROUPS = [
+    ("manager", "Manager", "/ce:flow orchestration"),
     ("ideate_brainstorm", "Ideate/Brainstorm", "/ce:ideate, /ce:brainstorm"),
     ("plan", "Planning", "/ce:plan"),
     ("work", "Work/Debug/Chat", "/ce:work, /ce:debug, general chat"),
@@ -1673,6 +1983,30 @@ def agent_turn(messages: list, model: str) -> str:
                 return f"[Malformed API response: {detail}; debug={debug_path}]"
             return f"[Malformed API response: {detail}]"
 
+        # Narration guard: if model is describing what to do instead of doing it, nudge it
+        _narration_keywords = [
+            "let me", "i need to", "i'll ", "i will", "i should",
+            "next step", "now i", "let's ",
+            "add a ", "add the ", "you need to", "you should", "you can ",
+            "here is the", "here's the", "the change", "the fix",
+            "insert the", "insert this", "add this", "place this",
+            "to implement", "to add", "would need to", "should be added",
+            "implementation", "result:", "**result**",
+        ]
+        _active_ce = getattr(_tui_instance, 'active_ce_mode', None) if _tui_instance else False
+        if (_active_ce and round_num < MAX_TOOL_ROUNDS - 1
+                and text
+                and any(kw in text.lower() for kw in _narration_keywords)):
+            _p = tui_print if _tui_instance else print
+            _ts = datetime.now().strftime("%H:%M:%S")
+            _p(f"[{_ts}] [auto-nudge: model narrated instead of acting]", C_DIM if _tui_instance else 0)
+            messages.append({"role": "assistant", "content": text})
+            messages.append({
+                "role": "user",
+                "content": "[System: Do not narrate what to do or show code for the user to apply manually. Use your tools (replace_in_file, write_file) to make the change RIGHT NOW. Make the tool call.]"
+            })
+            continue
+
         messages.append({"role": "assistant", "content": text})
         return text
 
@@ -1739,6 +2073,7 @@ class AgentTUI:
         self.messages = messages
         self.active_ce_mode = active_ce_mode
         self.models = models or []
+        self.workflow_state = CEWorkflowState()
 
         # Output
         self.output_lines = []  # list of (str, color_pair_num)
@@ -3123,7 +3458,9 @@ class AgentTUI:
             self.messages.clear()
             self.messages.append({"role": "system", "content": SYSTEM_PROMPT.format(work_dir=WORK_DIR)})
             self.active_ce_mode = None
+            self.workflow_state = CEWorkflowState()
             SESSION_TODOS.clear()
+            _reset_session_docs()
             with self.output_lock:
                 self.output_lines.clear()
             self.add_output("Conversation, todos, and critical context cleared.", C_GREEN)
@@ -3138,11 +3475,22 @@ class AgentTUI:
             lines.append(f"Working dir: {WORK_DIR}")
             if self.active_ce_mode:
                 lines.append(f"CE Mode: {self.active_ce_mode}")
+            if self.workflow_state.active:
+                wait_state = "waiting for user" if self.workflow_state.awaiting_user else "running"
+                lines.append(f"Managed flow: {wait_state}")
+                if self.workflow_state.completed_phases:
+                    lines.append(f"Completed phases: {', '.join(self.workflow_state.completed_phases)}")
             if SESSION_TODOS:
                 done = sum(1 for t in SESSION_TODOS if t["done"])
                 lines.append(f"Todos: {done}/{len(SESSION_TODOS)} complete")
             lines.append(tool_git_status())
             self.add_output("\n".join(lines), C_DEFAULT)
+            return
+        elif text == "/ce:flow":
+            self._start_managed_flow("Drive the full Compound Engineering workflow for the current task.")
+            return
+        elif text.startswith("/ce:flow "):
+            self._start_managed_flow(text[len("/ce:flow "):].strip())
             return
         elif text == "/ce:learnings":
             self.add_output(tool_ce_read_learnings(), C_DEFAULT)
@@ -3154,8 +3502,19 @@ class AgentTUI:
             if self.active_ce_mode:
                 self.add_output(f"--- Exiting {self.active_ce_mode.upper()} mode ---", C_MAGENTA)
                 self.active_ce_mode = None
+                self.workflow_state = CEWorkflowState()
             else:
                 self.add_output("Not in a CE mode.", C_DEFAULT)
+            return
+
+        if self.workflow_state.active and self.active_ce_mode == "flow":
+            self.workflow_state.awaiting_user = False
+            self.workflow_state.pending_question = ""
+            self.workflow_state.manager_messages.append({
+                "role": "user",
+                "content": f"User response for the managed workflow:\n{text}",
+            })
+            self._run_managed_flow_async()
             return
 
         # CE workflow commands -- match /ce:cmd at start, as prefix, or inline
@@ -3263,8 +3622,9 @@ class AgentTUI:
             lines.append(f"  {i}. {m}")
         lines.append("")
         lines.append("Type '<letter><N>' to change a group's model:")
-        lines.append("  a=Ideate/Brainstorm, b=Plan, c=Work, d=Review, e=Compound")
-        lines.append("  e.g. a1 = set Ideate/Brainstorm to model 1, c2 = set Work to model 2")
+        selector_map = ", ".join(f"{chr(ord('a') + i)}={label}" for i, (_, label, _) in enumerate(MODEL_GROUPS))
+        lines.append(f"  {selector_map}")
+        lines.append("  e.g. a1 = set the first group to model 1")
         self.add_output("\n".join(lines), C_DEFAULT)
         self._pending_model_select = True
 
@@ -3276,7 +3636,8 @@ class AgentTUI:
         text = text.strip().lower()
         group_keys = [gk for gk, _, _ in MODEL_GROUPS]
         group_labels = [gl for _, gl, _ in MODEL_GROUPS]
-        if len(text) >= 2 and text[0] in 'abcde':
+        valid_prefixes = ''.join(chr(ord('a') + i) for i in range(len(group_keys)))
+        if len(text) >= 2 and text[0] in valid_prefixes:
             group_idx = ord(text[0]) - ord('a')
             if group_idx < len(group_keys):
                 try:
@@ -3293,8 +3654,152 @@ class AgentTUI:
                         return True
                 except ValueError:
                     pass
-        self.add_output("Invalid choice. Use <letter><N> (e.g. a1, c2). Letters: a-e.", C_YELLOW)
+        self.add_output(f"Invalid choice. Use <letter><N>. Letters: {valid_prefixes}.", C_YELLOW)
         return True
+
+    def _start_managed_flow(self, objective: str):
+        self.workflow_state = CEWorkflowState(
+            active=True,
+            objective=objective,
+            manager_messages=[
+                {"role": "system", "content": MANAGER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request:\n{objective}\n\n"
+                        f"Current workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                        "Start orchestrating the Compound Engineering flow."
+                    ),
+                },
+            ],
+        )
+        self.active_ce_mode = "flow"
+        self.add_output("--- Entering FLOW mode ---", C_MAGENTA)
+        self._run_managed_flow_async()
+
+    def _run_managed_flow_async(self):
+        self.agent_running = True
+        self.interrupt_event.clear()
+        self.needs_redraw = True
+
+        def worker():
+            try:
+                response = self._managed_flow_tui()
+                if response:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    self.add_output(f"\n[{ts}] Agent: {response}", C_GREEN)
+            except Exception as e:
+                self.add_output(f"\nAgent error: {e}", C_RED)
+            finally:
+                self.agent_running = False
+                self.needs_redraw = True
+                self._drain_pending_queue()
+
+        self.agent_thread = threading.Thread(target=worker, daemon=True)
+        self.agent_thread.start()
+
+    def _run_workflow_manager_turn(self) -> dict:
+        saved_mode = self.active_ce_mode
+        self.active_ce_mode = "flow"
+        self._ensure_model()
+        self._activity = "manager deciding..."
+        self.needs_redraw = True
+        try:
+            decision, raw_text = run_manager_turn(self.workflow_state.manager_messages, self.active_model)
+        except Exception as exc:
+            decision = None
+            raw_text = f"[manager exception] {exc}"
+        self.active_ce_mode = saved_mode or "flow"
+        if not decision:
+            self.workflow_state.manager_failures += 1
+            decision = _manager_autorecover_decision(self.workflow_state, raw_text)
+            self.workflow_state.manager_messages.append({
+                "role": "user",
+                "content": f"[Manager autorecovery triggered] {decision['message']}",
+            })
+        return decision
+
+    def _run_phase_from_flow(self, phase: str, phase_input: str) -> str:
+        actual_phase = "plan" if phase == "deepen_plan" else phase
+        mode_prompt = CE_PROMPTS[actual_phase]
+        handoff = _build_manager_handoff(self.workflow_state.manager_messages, phase, phase_input)
+        manager_model = self.model_groups["manager"]["model"]
+        target_model = self.model_groups[CE_MODE_TO_GROUP[actual_phase]]["model"]
+        if self._current_model_name == manager_model and manager_model != target_model:
+            unload_omlx_model(manager_model)
+            self._current_group = None
+            self._current_model_name = None
+
+        start_idx = len(self.messages)
+        self.messages.append({
+            "role": "system",
+            "content": f"[Entering {phase.upper()} via FLOW manager]\n{mode_prompt}",
+        })
+        self.messages.append({"role": "system", "content": handoff})
+        self.messages.append({"role": "user", "content": self._build_user_content(phase_input)})
+        saved_mode = self.active_ce_mode
+        self.active_ce_mode = actual_phase
+        result = self._agent_turn_tui()
+        self.active_ce_mode = saved_mode or "flow"
+        del self.messages[start_idx:start_idx + 2]
+        return result
+
+    def _managed_flow_tui(self) -> str:
+        max_iterations = 80
+        iterations = 0
+        while self.workflow_state.active:
+            iterations += 1
+            if iterations > max_iterations:
+                self.workflow_state.active = False
+                self.active_ce_mode = None
+                return "Managed flow stopped after too many recovery iterations."
+            if self.interrupt_event.is_set():
+                self.interrupt_event.clear()
+                return "[Cancelled by user]"
+
+            decision = self._run_workflow_manager_turn()
+            action = decision["action"]
+
+            if action == "ask_user":
+                question = decision["question"] or decision["message"] or "What should I clarify before continuing?"
+                self.workflow_state.awaiting_user = True
+                self.workflow_state.pending_question = question
+                return question
+
+            if action == "complete":
+                self.workflow_state.active = False
+                self.workflow_state.awaiting_user = False
+                self.workflow_state.pending_question = ""
+                self.active_ce_mode = None
+                return decision["message"] or "Managed Compound Engineering flow complete."
+
+            phase = decision["phase"]
+            status = decision["message"] or decision["reason"] or f"Running {phase}"
+            self.add_output(f"[Manager] {status}", C_YELLOW)
+            phase_succeeded = True
+            try:
+                result = self._run_phase_from_flow(phase, decision["phase_input"])
+                self.workflow_state.phase_failures = 0
+            except Exception as exc:
+                phase_succeeded = False
+                self.workflow_state.phase_failures += 1
+                result = f"[Phase {phase} exception] {exc}"
+            if phase_succeeded:
+                self.workflow_state.completed_phases.append(phase)
+            self.workflow_state.awaiting_user = False
+            self.workflow_state.pending_question = ""
+            self.workflow_state.manager_messages.append({
+                "role": "user",
+                "content": (
+                    f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
+                    f"Completed phases: {', '.join(self.workflow_state.completed_phases)}\n"
+                    f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                    f"Phase result:\n{result[:4000]}"
+                ),
+            })
+
+        self.active_ce_mode = None
+        return "Managed Compound Engineering flow complete."
 
     def _try_concurrency_select(self, text: str) -> bool:
         """No longer used - concurrency is auto-estimated."""
@@ -3457,19 +3962,27 @@ class AgentTUI:
                     return f"[Malformed API response: {detail}]"
 
                 # Final text response -- but check if the model is narrating instead of acting
-                self.messages.append({"role": "assistant", "content": text})
+                _narration_keywords = [
+                    "let me", "i need to", "i'll ", "i will", "i should",
+                    "next step", "now i", "let's ",
+                    "add a ", "add the ", "you need to", "you should", "you can ",
+                    "here is the", "here's the", "the change", "the fix",
+                    "insert the", "insert this", "add this", "place this",
+                    "to implement", "to add", "would need to", "should be added",
+                    "implementation", "result:", "**result**",
+                ]
                 if (self.active_ce_mode and round_num < MAX_TOOL_ROUNDS - 1
-                        and text and len(text.strip()) < 300
-                        and any(kw in text.lower() for kw in
-                                ["let me", "i need to", "i'll ", "i will", "i should",
-                                 "next step", "now i", "let's "])):
+                        and text
+                        and any(kw in text.lower() for kw in _narration_keywords)):
                     _ts = datetime.now().strftime("%H:%M:%S")
                     tui_print(f"[{_ts}] [auto-nudge: model narrated instead of acting]", C_DIM)
+                    self.messages.append({"role": "assistant", "content": text})
                     self.messages.append({
                         "role": "user",
-                        "content": "[System: Do not narrate what you plan to do. Use your tools to do it NOW. Make the tool call.]"
+                        "content": "[System: Do not narrate what to do or show code for the user to apply manually. Use your tools (replace_in_file, write_file) to make the change RIGHT NOW. Make the tool call.]"
                     })
                     continue
+                self.messages.append({"role": "assistant", "content": text})
                 return text
 
             # Max rounds hit -- auto-continue instead of stopping
@@ -3582,12 +4095,13 @@ class AgentTUI:
 
 
 HELP_TEXT = """Commands:
-  /model              Switch model for a CE step group (a-e + model#)
+    /model              Switch model for a CE step group (letter + model#)
   /clear              Clear conversation
   /status             Show git status and session info
   /quit               Exit (also Ctrl+D)
 
 Compound Engineering:
+    /ce:flow            Manager-run CE flow across brainstorm, plan, work, review, compound
   /ce:brainstorm      Explore ideas and requirements
   /ce:plan            Create a structured implementation plan
   /ce:work            Execute work with task tracking
@@ -3760,6 +4274,7 @@ def _main_plain(model_config, messages, models):
     print("-" * 60)
 
     active_ce_mode = None
+    workflow_state = CEWorkflowState()
     _current_model_name = None
 
     def _get_model():
@@ -3778,6 +4293,29 @@ def _main_plain(model_config, messages, models):
                 settings["max_model_memory"] = cfg["memory"]
             set_omlx_settings(settings)
         _current_model_name = new_model
+
+    def _run_plain_phase_from_flow(phase: str, phase_input: str, manager_messages: list) -> str:
+        nonlocal active_ce_mode, _current_model_name
+        actual_phase = "plan" if phase == "deepen_plan" else phase
+        handoff = _build_manager_handoff(manager_messages, phase, phase_input)
+        manager_model = model_config["manager"]["model"]
+        target_model = model_config[CE_MODE_TO_GROUP[actual_phase]]["model"]
+        if _current_model_name == manager_model and manager_model != target_model:
+            unload_omlx_model(manager_model)
+            _current_model_name = None
+
+        start_idx = len(messages)
+        active_ce_mode = actual_phase
+        messages.append({
+            "role": "system",
+            "content": f"[Entering {phase.upper()} via FLOW manager]\n{CE_PROMPTS[actual_phase]}",
+        })
+        messages.append({"role": "system", "content": handoff})
+        messages.append({"role": "user", "content": phase_input})
+        _ensure_model_plain()
+        result = agent_turn(messages, _get_model())
+        del messages[start_idx:start_idx + 2]
+        return result
 
     while True:
         try:
@@ -3806,7 +4344,9 @@ def _main_plain(model_config, messages, models):
             messages.clear()
             messages.append({"role": "system", "content": SYSTEM_PROMPT.format(work_dir=WORK_DIR)})
             active_ce_mode = None
+            workflow_state = CEWorkflowState()
             SESSION_TODOS.clear()
+            _reset_session_docs()
             print("Conversation, todos, and critical context cleared.")
             continue
         elif user_input == "/status":
@@ -3820,16 +4360,160 @@ def _main_plain(model_config, messages, models):
             print(f"Working dir: {WORK_DIR}")
             if active_ce_mode:
                 print(f"CE Mode: {active_ce_mode}")
+            if workflow_state.active:
+                wait_state = "waiting for user" if workflow_state.awaiting_user else "running"
+                print(f"Managed flow: {wait_state}")
+                if workflow_state.completed_phases:
+                    print(f"Completed phases: {', '.join(workflow_state.completed_phases)}")
             if SESSION_TODOS:
                 done = sum(1 for t in SESSION_TODOS if t["done"])
                 print(f"Todos: {done}/{len(SESSION_TODOS)} complete")
             print(tool_git_status())
+            continue
+        elif user_input == "/ce:flow" or user_input.startswith("/ce:flow "):
+            objective = user_input[len("/ce:flow "):].strip() if user_input.startswith("/ce:flow ") else "Drive the full Compound Engineering workflow for the current task."
+            workflow_state = CEWorkflowState(
+                active=True,
+                objective=objective,
+                manager_messages=[
+                    {"role": "system", "content": MANAGER_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User request:\n{objective}\n\n"
+                            f"Current workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                            "Start orchestrating the Compound Engineering flow."
+                        ),
+                    },
+                ],
+            )
+            active_ce_mode = "flow"
+            print("\n\033[1;35m--- Entering FLOW mode ---\033[0m")
+            iterations = 0
+            while workflow_state.active:
+                iterations += 1
+                if iterations > 80:
+                    workflow_state.active = False
+                    active_ce_mode = None
+                    print("Managed flow stopped after too many recovery iterations.")
+                    break
+                _ensure_model_plain()
+                try:
+                    decision, raw_text = run_manager_turn(workflow_state.manager_messages, _get_model())
+                except Exception as exc:
+                    decision = None
+                    raw_text = f"[manager exception] {exc}"
+                if not decision:
+                    workflow_state.manager_failures += 1
+                    decision = _manager_autorecover_decision(workflow_state, raw_text)
+                    workflow_state.manager_messages.append({
+                        "role": "user",
+                        "content": f"[Manager autorecovery triggered] {decision['message']}",
+                    })
+                if decision["action"] == "ask_user":
+                    workflow_state.awaiting_user = True
+                    workflow_state.pending_question = decision["question"]
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['question']}")
+                    break
+                if decision["action"] == "complete":
+                    workflow_state.active = False
+                    workflow_state.awaiting_user = False
+                    active_ce_mode = None
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['message'] or 'Managed Compound Engineering flow complete.'}")
+                    break
+
+                phase = decision["phase"]
+                phase_succeeded = True
+                try:
+                    result = _run_plain_phase_from_flow(phase, decision["phase_input"], workflow_state.manager_messages)
+                    workflow_state.phase_failures = 0
+                except Exception as exc:
+                    phase_succeeded = False
+                    workflow_state.phase_failures += 1
+                    result = f"[Phase {phase} exception] {exc}"
+                if phase_succeeded:
+                    workflow_state.completed_phases.append(phase)
+                workflow_state.awaiting_user = False
+                workflow_state.pending_question = ""
+                workflow_state.manager_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
+                        f"Completed phases: {', '.join(workflow_state.completed_phases)}\n"
+                        f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                        f"Phase result:\n{result[:4000]}"
+                    ),
+                })
             continue
         elif user_input == "/ce:learnings":
             print(tool_ce_read_learnings())
             continue
         elif user_input == "/ce:todos":
             print(tool_ce_manage_todos("list"))
+            continue
+
+        if workflow_state.active and active_ce_mode == "flow":
+            workflow_state.awaiting_user = False
+            workflow_state.pending_question = ""
+            workflow_state.manager_messages.append({
+                "role": "user",
+                "content": f"User response for the managed workflow:\n{user_input}",
+            })
+            iterations = 0
+            while workflow_state.active:
+                iterations += 1
+                if iterations > 80:
+                    workflow_state.active = False
+                    active_ce_mode = None
+                    print("Managed flow stopped after too many recovery iterations.")
+                    break
+                active_ce_mode = "flow"
+                _ensure_model_plain()
+                try:
+                    decision, raw_text = run_manager_turn(workflow_state.manager_messages, _get_model())
+                except Exception as exc:
+                    decision = None
+                    raw_text = f"[manager exception] {exc}"
+                if not decision:
+                    workflow_state.manager_failures += 1
+                    decision = _manager_autorecover_decision(workflow_state, raw_text)
+                    workflow_state.manager_messages.append({
+                        "role": "user",
+                        "content": f"[Manager autorecovery triggered] {decision['message']}",
+                    })
+                if decision["action"] == "ask_user":
+                    workflow_state.awaiting_user = True
+                    workflow_state.pending_question = decision["question"]
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['question']}")
+                    break
+                if decision["action"] == "complete":
+                    workflow_state.active = False
+                    workflow_state.awaiting_user = False
+                    active_ce_mode = None
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] \033[1;32mAgent:\033[0m {decision['message'] or 'Managed Compound Engineering flow complete.'}")
+                    break
+                phase = decision["phase"]
+                phase_succeeded = True
+                try:
+                    result = _run_plain_phase_from_flow(phase, decision["phase_input"], workflow_state.manager_messages)
+                    workflow_state.phase_failures = 0
+                except Exception as exc:
+                    phase_succeeded = False
+                    workflow_state.phase_failures += 1
+                    result = f"[Phase {phase} exception] {exc}"
+                if phase_succeeded:
+                    workflow_state.completed_phases.append(phase)
+                workflow_state.awaiting_user = False
+                workflow_state.pending_question = ""
+                workflow_state.manager_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
+                        f"Completed phases: {', '.join(workflow_state.completed_phases)}\n"
+                        f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                        f"Phase result:\n{result[:4000]}"
+                    ),
+                })
             continue
 
         ce_cmd = None
@@ -3880,6 +4564,7 @@ def _main_plain(model_config, messages, models):
             if active_ce_mode:
                 print(f"\033[1;35m--- Exiting {active_ce_mode.upper()} mode ---\033[0m")
                 active_ce_mode = None
+                workflow_state = CEWorkflowState()
             else:
                 print("Not in a CE mode.")
             continue
