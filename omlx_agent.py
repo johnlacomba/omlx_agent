@@ -29,7 +29,7 @@ API_KEY = os.environ.get("OMLX_API_KEY", "omlx-80ktncu2cdui9fal")
 MAX_TOKENS = 49152  # Cap output tokens to prevent KV cache OOM on 48GB systems
 MAX_TOOL_ROUNDS = 40
 EMERGENCY_TRIM_DROP = 20  # Messages to drop when oMLX returns "Prompt too long"
-LEARNINGS_FILE = "compound-engineering.local.md"
+LEARNINGS_FILE = ".compound-engineering/learnings.md"
 INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json")
 MAX_INPUT_HISTORY = 200
@@ -311,6 +311,33 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ce_run_agent",
+            "description": "Spawn a vendored Compound Engineering sub-agent with isolated context. Use this from a /ce: skill to dispatch reviewer, researcher, or document-review personas (e.g. ce-correctness-reviewer, ce-security-reviewer, ce-learnings-researcher). Returns the sub-agent's final output, typically structured JSON. The sub-agent runs to completion in a fresh conversation that does not see your current messages -- pass everything the agent needs in `task`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_name": {"type": "string", "description": "Vendored agent name without .agent.md, e.g. 'ce-correctness-reviewer'. Use ce_list_agents to discover available agents."},
+                    "task": {"type": "string", "description": "Full task description and all context the sub-agent needs (diff, file paths, document path, prior findings to dedupe against, etc.). Be explicit -- the sub-agent does not see your conversation."},
+                },
+                "required": ["agent_name", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ce_list_agents",
+            "description": "List all vendored Compound Engineering sub-agents available via ce_run_agent. Returns names and one-line descriptions.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 WORK_DIR = os.getcwd()
@@ -340,32 +367,57 @@ MANAGER_SYSTEM_PROMPT = """You are the Compound Engineering manager layer for a 
 
 You do not implement code directly. You orchestrate the workflow across specialist phases and pause only when the user must answer a real question.
 
-Responsibilities:
-- Decide whether to run brainstorm, plan, deepen_plan, work, review, or compound next.
+## Available specialist phases
+
+Each phase below loads a vendored Compound Engineering skill (from EveryInc/compound-engineering-plugin) when invoked. The skill itself dispatches further sub-agents (reviewer personas, document-review personas, researchers) as needed -- you do not pick those.
+
+Core sequence (use these for a typical feature workflow):
+- `brainstorm` -- ce-brainstorm: explore requirements through collaborative dialogue, save a requirements doc.
+- `plan` -- ce-plan: create a structured implementation plan with checkboxes.
+- `deepen_plan` -- ce-plan: deepening pass that runs sub-agent research on the existing plan.
+- `doc_review` -- ce-doc-review: run persona reviewers (product-lens, design-lens, security-lens, scope-guardian, feasibility, coherence, adversarial) against the requirements or plan document. Insert this between `deepen_plan` and `work` when the plan makes architectural decisions, has more than ~5 implementation units, or covers a high-stakes domain. Pass the document path in phase_input.
+- `work` -- ce-work: execute the plan step by step.
+- `review` -- ce-code-review: tiered code review. Internally spawns the relevant reviewer agents (correctness, testing, maintainability, project-standards, agent-native, learnings-researcher, plus security/performance/api-contract/data-migrations/reliability/adversarial when the diff warrants). You do not list reviewers in phase_input -- the skill picks them.
+- `compound` -- ce-compound: document learnings into .compound-engineering/learnings.md and solution docs.
+
+Optional phases (use only when explicitly relevant, not by default):
+- `ideate` -- ce-ideate: generate and rank improvement ideas. Use only when the user's objective is "what should we work on?" rather than a specific request.
+- `debug` -- ce-debug: systematic root-cause investigation. Use instead of `work` when the objective is reproducing or fixing a bug.
+- `compound_refresh` -- ce-compound-refresh: age out, replace, or archive stale learnings. Use only when the user explicitly asks to clean up the learnings file.
+
+## Responsibilities
+
+- Decide which phase to run next.
 - Ask the user one concise question at a time only when requirements, scope, approvals, or missing decisions block progress.
-- Keep actual implementation confined to the work phase.
-- Treat brainstorm, plan, deepen_plan, review, and compound as non-implementation phases. They may read and write planning, review, and solution artifacts, but they must not change product code.
-- Once enough information exists, move forward without waiting for the user: brainstorm if needed, then plan, then deepen_plan, then work, then review, then compound.
+- Keep actual implementation confined to `work` (or `debug` for bug investigations).
+- Treat brainstorm, plan, deepen_plan, doc_review, ideate, review, compound, and compound_refresh as non-implementation phases. They may read and write planning, review, and solution artifacts, but they must not change product code.
+- Once enough information exists, move forward without waiting for the user.
 - Prefer reusing existing brainstorms or plans when they already fit the request.
+
+## Return format
 
 Return JSON only with this schema:
 {
   "action": "ask_user" | "run_phase" | "complete",
-  "phase": "brainstorm" | "plan" | "deepen_plan" | "work" | "review" | "compound" | "",
+  "phase": "brainstorm" | "plan" | "deepen_plan" | "doc_review" | "ideate" | "work" | "debug" | "review" | "compound" | "compound_refresh" | "",
   "message": "short status or completion summary",
   "question": "question for the user when action=ask_user",
   "phase_input": "the exact instruction to send to the specialist phase when action=run_phase",
   "reason": "brief explanation for why this is the right next step"
 }
 
-Rules:
+## Rules
+
 - action=ask_user: set question, leave phase empty, leave phase_input empty.
 - action=run_phase: set phase and phase_input. question must be empty.
 - action=complete: give a short final summary in message.
-- Never choose work before a plan exists and has been deepened.
-- Never choose review before work.
-- Never choose compound before review.
-- When deciding between brainstorm and plan, choose brainstorm if user-facing behavior or scope is still unclear. Otherwise choose plan.
+- For `doc_review`, phase_input MUST include the document path (e.g. "Review docs/plans/2026-04-22-001-foo-plan.md against the requirements at docs/brainstorms/2026-04-22-foo-requirements.md"). The doc-review skill cannot find the doc on its own when invoked headlessly.
+- For `review`, do NOT specify which reviewer personas to use. The ce-code-review skill selects them based on the diff.
+- Never choose `work` before a plan exists and has been deepened.
+- Never choose `review` before `work` (or `debug` for bug fixes).
+- Never choose `compound` before `review`.
+- `doc_review` (when used) must come after `deepen_plan` and before `work`.
+- When deciding between `brainstorm` and `plan`, choose `brainstorm` if user-facing behavior or scope is still unclear. Otherwise choose `plan`.
 - Output valid JSON only. No markdown fences or commentary outside the JSON object.
 """
 
@@ -457,7 +509,10 @@ def _parse_manager_decision(text: str) -> dict | None:
     if action not in {"ask_user", "run_phase", "complete"}:
         return None
     phase = data.get("phase", "") or ""
-    if action == "run_phase" and phase not in {"brainstorm", "plan", "deepen_plan", "work", "review", "compound"}:
+    if action == "run_phase" and phase not in {
+        "brainstorm", "plan", "deepen_plan", "doc_review", "ideate",
+        "work", "debug", "review", "compound", "compound_refresh",
+    }:
         return None
     if action == "ask_user" and not (data.get("question") or "").strip():
         return None
@@ -528,6 +583,7 @@ def _manager_fallback_decision(raw_text: str) -> dict:
 
 def _failsafe_phase_input(phase: str, objective: str, artifacts: dict) -> str:
     plan_path = artifacts.get("plan") or ""
+    brainstorm_path = artifacts.get("brainstorm") or ""
     if phase == "brainstorm":
         return f"Managed failsafe: run a focused brainstorm for this objective and save requirements. Objective: {objective}"
     if phase == "plan":
@@ -536,14 +592,25 @@ def _failsafe_phase_input(phase: str, objective: str, artifacts: dict) -> str:
         if plan_path:
             return f"Managed failsafe: deepen this existing plan before work: {plan_path}"
         return "Managed failsafe: deepen the most relevant active plan before work."
+    if phase == "doc_review":
+        target = plan_path or brainstorm_path
+        if target:
+            return f"Managed failsafe: run ce-doc-review against {target} in mode:headless. Return findings as structured text."
+        return "Managed failsafe: run ce-doc-review against the most recent plan or brainstorm in mode:headless."
+    if phase == "ideate":
+        return f"Managed failsafe: run ce-ideate to generate ranked improvement ideas for this objective. Objective: {objective}"
     if phase == "work":
         if plan_path:
             return f"Managed failsafe: execute work from this plan: {plan_path}"
         return f"Managed failsafe: execute the objective directly and maintain todos. Objective: {objective}"
+    if phase == "debug":
+        return f"Managed failsafe: run ce-debug systematic root-cause investigation for this objective. Objective: {objective}"
     if phase == "review":
-        return "Managed failsafe: review the changes produced by the work phase and capture prioritized findings."
+        return "Managed failsafe: review the changes produced by the work phase using the tiered ce-code-review pipeline. Let the skill select reviewer personas based on the diff."
     if phase == "compound":
         return "Managed failsafe: document learnings and solution notes from this completed workflow."
+    if phase == "compound_refresh":
+        return "Managed failsafe: refresh stale or drifting learnings in .compound-engineering/learnings.md."
     return objective
 
 
@@ -627,19 +694,17 @@ def _deterministic_completion_block(workflow_state: CEWorkflowState) -> dict | N
 
     next_phase: str | None = None
     reason = ""
+    # Only block if implementation is required and the work phase has never run.
+    # Once work has executed at least once, trust the manager's completion claim --
+    # the user can verify and re-engage if needed. Do NOT force review/compound for
+    # small fixes; that thrashes the flow on simple bug fixes.
     if needs_impl and "work" not in completed:
         if not artifacts.get("plan") and "plan" not in completed:
             next_phase = "plan"
             reason = "Objective requires implementation but no plan exists yet."
-        elif "deepen_plan" not in completed:
-            next_phase = "deepen_plan"
-            reason = "Objective requires implementation; deepen the plan before working."
         else:
             next_phase = "work"
             reason = "Objective requires implementation but the work phase has not run."
-    elif needs_impl and "work" in completed and "review" not in completed:
-        next_phase = "review"
-        reason = "Work completed but no review phase has run."
 
     if not next_phase:
         return None
@@ -656,15 +721,26 @@ def _deterministic_completion_block(workflow_state: CEWorkflowState) -> dict | N
 
 
 _COMPLETION_VERIFY_PROMPT = (
-    "You are verifying whether the managed Compound Engineering flow has actually "
-    "satisfied the user's original objective.\n\n"
+    "You are verifying whether the managed Compound Engineering flow has satisfied "
+    "the user's original objective.\n\n"
     "Original user objective:\n{objective}\n\n"
     "Completed phases: {completed}\n"
     "Workflow artifacts:\n{artifacts}\n\n"
     "Manager's proposed final summary:\n{final_message}\n\n"
-    "Compare the proposed summary against the original objective. Did the flow actually "
-    "do what the user asked, including any required implementation work, or did it stop "
-    "after only producing planning artifacts when the user wanted real changes?\n\n"
+    "DEFAULT TO 'complete' UNLESS THERE IS CLEAR EVIDENCE THE WORK WAS NOT DONE.\n"
+    "Only reply 'incomplete' when one of these is true:\n"
+    "  - The objective explicitly required code changes but the work phase never ran\n"
+    "    (work is NOT in the completed phases list).\n"
+    "  - The final summary itself admits the task is unfinished, blocked, or only\n"
+    "    partially done.\n"
+    "  - The summary describes only planning/discussion when the user asked for a\n"
+    "    real change.\n\n"
+    "Do NOT reply 'incomplete' just because:\n"
+    "  - You cannot personally see test results or run the code.\n"
+    "  - You think more polishing, review, or extra phases would be nice.\n"
+    "  - The summary is brief.\n"
+    "  - You did not personally inspect the diff.\n"
+    "If work has run and the summary claims the fix or feature is done, trust it.\n\n"
     "Reply with JSON only using this schema:\n"
     "{{\n"
     '  "verdict": "complete" | "incomplete",\n'
@@ -725,6 +801,22 @@ def run_completion_verifier(workflow_state: CEWorkflowState, final_message: str,
     return None
 
 
+# Manager JSON uses underscores for multi-word phases (doc_review,
+# compound_refresh) so they are valid identifier-style values. The omlx
+# CE mode names use hyphens to match upstream skill directory names
+# (doc-review, compound-refresh). Translate when handing off.
+_MANAGER_PHASE_TO_CE_MODE = {
+    "deepen_plan": "plan",
+    "doc_review": "doc-review",
+    "compound_refresh": "compound-refresh",
+}
+
+
+def _phase_to_ce_mode(phase: str) -> str:
+    """Translate a manager-decision phase name into the omlx CE mode name."""
+    return _MANAGER_PHASE_TO_CE_MODE.get(phase, phase)
+
+
 def _build_manager_handoff(manager_messages: list, phase: str, phase_input: str) -> str:
     phase_label = "plan (deepening pass)" if phase == "deepen_plan" else phase
     recent_messages = manager_messages[-6:]
@@ -762,6 +854,80 @@ def resolve(path: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.join(WORK_DIR, path)
+
+
+# ── Compound Engineering Setup Detection ────────────────────────────────────
+# Mirrors the artifacts that the vendored ce-setup skill creates so we can
+# detect whether the user has ever run /ce:setup in the current repo.
+
+def _git_repo_root(start: str | None = None) -> str | None:
+    """Return the git repo root containing `start`, or None if not in a repo."""
+    cwd = start or WORK_DIR
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd, capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return root or None
+
+
+def ce_setup_status(repo_dir: str | None = None) -> dict:
+    """Inspect the repo for ce-setup artifacts.
+
+    Returns a dict with:
+      - ok: True iff config.local.yaml exists and the obsolete file is gone
+      - in_git_repo: True iff `repo_dir` is inside a git working tree
+      - repo_root: absolute path to the git root (or `repo_dir` fallback)
+      - has_local_config: bool, .compound-engineering/config.local.yaml exists
+      - has_example_config: bool, .compound-engineering/config.local.example.yaml exists
+      - has_obsolete_local_md: bool, root-level compound-engineering.local.md is present
+      - missing: list[str] of human-readable issues
+    """
+    root = _git_repo_root(repo_dir) or os.path.abspath(repo_dir or WORK_DIR)
+    in_git = _git_repo_root(repo_dir) is not None
+    ce_dir = os.path.join(root, ".compound-engineering")
+    local_cfg = os.path.join(ce_dir, "config.local.yaml")
+    example_cfg = os.path.join(ce_dir, "config.local.example.yaml")
+    obsolete = os.path.join(root, "compound-engineering.local.md")
+
+    has_local = os.path.isfile(local_cfg)
+    has_example = os.path.isfile(example_cfg)
+    has_obsolete = os.path.isfile(obsolete)
+
+    missing = []
+    if not has_local:
+        missing.append("`.compound-engineering/config.local.yaml` is missing")
+    if not has_example:
+        missing.append("`.compound-engineering/config.local.example.yaml` is missing")
+    if has_obsolete:
+        missing.append("obsolete `compound-engineering.local.md` is still present")
+
+    return {
+        "ok": has_local and not has_obsolete,
+        "in_git_repo": in_git,
+        "repo_root": root,
+        "has_local_config": has_local,
+        "has_example_config": has_example,
+        "has_obsolete_local_md": has_obsolete,
+        "missing": missing,
+    }
+
+
+def format_ce_setup_warning(status: dict) -> list[str]:
+    """Render a multi-line yellow warning describing what /ce:setup would fix."""
+    lines = [
+        "[Compound Engineering] /ce:setup has not been run for this repo.",
+        f"  Repo: {status['repo_root']}",
+    ]
+    for item in status["missing"]:
+        lines.append(f"  - {item}")
+    lines.append("  Run /ce:setup to bootstrap the project config and verify dependencies.")
+    return lines
 
 
 # ── Tool Implementations ────────────────────────────────────────────────────
@@ -1299,10 +1465,233 @@ TOOL_DISPATCH = {
     "ce_mark_step": lambda args: tool_ce_mark_step(args["file_path"], args["step_text"]),
     "ce_list_docs": lambda args: tool_ce_list_docs(args.get("doc_type")),
     "ce_scan_solution_headers": lambda args: tool_ce_scan_solution_headers(args.get("directory")),
+    "ce_run_agent": lambda args: tool_ce_run_agent(args["agent_name"], args["task"]),
+    "ce_list_agents": lambda args: tool_ce_list_agents(),
 }
 
 
-# ── Compound Engineering Workflow Prompts ────────────────────────────────────
+# ── Compound Engineering Vendor Loader ───────────────────────────────────────
+#
+# omlx_agent vendors the official EveryInc/compound-engineering-plugin
+# agents/ and skills/ verbatim under ./compound-engineering/. This loader
+# parses the YAML frontmatter + Markdown body so we can use upstream prompts
+# instead of paraphrasing them inline. Refresh with ./sync-ce-vendor.sh.
+
+CE_VENDOR_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "compound-engineering"
+)
+_CE_AGENT_CACHE: dict[str, dict] = {}
+_CE_SKILL_CACHE: dict[str, dict] = {}
+
+# Map omlx_agent's short mode names to vendored skill directory names.
+# When invoked as /ce:<mode>, we load the corresponding skill's SKILL.md
+# body and inject it as the active system prompt.
+CE_MODE_TO_SKILL = {
+    "brainstorm": "ce-brainstorm",
+    "ideate": "ce-ideate",
+    "plan": "ce-plan",
+    "work": "ce-work",
+    "debug": "ce-debug",
+    "review": "ce-code-review",
+    "code-review": "ce-code-review",
+    "compound": "ce-compound",
+    "compound-refresh": "ce-compound-refresh",
+    "doc-review": "ce-doc-review",
+    "commit": "ce-commit",
+    "pr-description": "ce-pr-description",
+    "commit-push-pr": "ce-commit-push-pr",
+    "setup": "ce-setup",
+    "test-browser": "ce-test-browser",
+    "worktree": "ce-worktree",
+    "clean-gone-branches": "ce-clean-gone-branches",
+    "optimize": "ce-optimize",
+    "sessions": "ce-sessions",
+    "demo-reel": "ce-demo-reel",
+    "report-bug": "ce-report-bug",
+    "resolve-pr-feedback": "ce-resolve-pr-feedback",
+    "polish-beta": "ce-polish-beta",
+    "lfg": "lfg",
+}
+
+# omlx_agent host-adaptation footer appended to every vendored prompt.
+# The vendored prompts assume Claude Code's host tools (Read, Write, Bash,
+# Grep, Glob, Edit, AskUserQuestion, Task subagent dispatch). This footer
+# tells the model how those map to omlx_agent's actual tool surface.
+CE_HOST_ADAPTATION = """
+
+---
+
+## omlx_agent host adaptation
+
+You are running inside omlx_agent (a single-file local-LLM coding agent),
+not Claude Code. The skill/agent prompt above was authored for Claude Code's
+host tools. Translate as follows:
+
+- `Read` -> `read_file`
+- `Write` -> `write_file`
+- `Edit` / `MultiEdit` -> `replace_in_file`
+- `Bash` -> `run_command`
+- `Grep` / `Glob` -> `search_files`
+- `Task` (subagent dispatch) -> `ce_run_agent` (spawn a vendored sub-agent
+  with isolated context; returns the sub-agent's final text/JSON)
+- `AskUserQuestion` / `request_user_input` / `ask_user` -> respond with a
+  plain-text question and stop. The user will reply on the next turn.
+- `WebSearch` / `WebFetch` -> not available; report the limitation in your
+  output instead of attempting the call.
+- `TodoWrite` -> `ce_manage_todos`
+
+CE document storage uses `docs/{brainstorms,plans,reviews,solutions,todos}/`
+via `ce_save_doc`, matching the upstream convention. Project learnings live
+in `.compound-engineering/learnings.md` via `ce_read_learnings` and
+`ce_write_learning`.
+
+When the upstream skill says "spawn parallel subagents," dispatch them
+sequentially via `ce_run_agent` (omlx_agent runs one model at a time on
+local hardware). Aggregate their JSON outputs yourself.
+"""
+
+
+def _parse_ce_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML-ish frontmatter (key: value lines between two ---) from a CE file.
+
+    Returns (frontmatter_dict, body_string). If no frontmatter delimiter is
+    found, returns ({}, original_text).
+    """
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.split("\n")
+    if len(lines) < 2 or lines[0].strip() != "---":
+        return {}, text
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return {}, text
+
+    fm: dict = {}
+    current_key: str | None = None
+    for raw in lines[1:end_idx]:
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        # key: value on one line
+        m = re.match(r"^([A-Za-z0-9_\-]+)\s*:\s*(.*)$", raw)
+        if m:
+            current_key = m.group(1)
+            value = m.group(2).strip()
+            # Strip surrounding quotes (single or double) if balanced
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            fm[current_key] = value
+        elif current_key and raw.startswith((" ", "\t")):
+            # multi-line continuation -- append with single space
+            fm[current_key] = (fm.get(current_key, "") + " " + raw.strip()).strip()
+
+    body = "\n".join(lines[end_idx + 1 :]).lstrip("\n")
+    return fm, body
+
+
+def _load_ce_doc(path: str) -> dict | None:
+    """Load and parse a vendored .agent.md or SKILL.md file."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    frontmatter, body = _parse_ce_frontmatter(text)
+    return {
+        "name": frontmatter.get("name", ""),
+        "description": frontmatter.get("description", ""),
+        "model": frontmatter.get("model", "inherit"),
+        "tools": frontmatter.get("tools", ""),
+        "argument_hint": frontmatter.get("argument-hint", ""),
+        "body": body,
+        "path": path,
+    }
+
+
+def load_ce_skill(skill_name: str) -> dict | None:
+    """Load a vendored skill by directory name (e.g. 'ce-code-review'). Cached."""
+    if skill_name in _CE_SKILL_CACHE:
+        return _CE_SKILL_CACHE[skill_name]
+    path = os.path.join(CE_VENDOR_DIR, "skills", skill_name, "SKILL.md")
+    doc = _load_ce_doc(path)
+    if doc is not None:
+        _CE_SKILL_CACHE[skill_name] = doc
+    return doc
+
+
+def load_ce_agent(agent_name: str) -> dict | None:
+    """Load a vendored agent by name (e.g. 'ce-correctness-reviewer'). Cached."""
+    if agent_name in _CE_AGENT_CACHE:
+        return _CE_AGENT_CACHE[agent_name]
+    path = os.path.join(CE_VENDOR_DIR, "agents", f"{agent_name}.agent.md")
+    doc = _load_ce_doc(path)
+    if doc is not None:
+        _CE_AGENT_CACHE[agent_name] = doc
+    return doc
+
+
+def list_ce_agents() -> list[str]:
+    """List all vendored agent names."""
+    agents_dir = os.path.join(CE_VENDOR_DIR, "agents")
+    if not os.path.isdir(agents_dir):
+        return []
+    out = []
+    for fn in sorted(os.listdir(agents_dir)):
+        if fn.endswith(".agent.md"):
+            out.append(fn[: -len(".agent.md")])
+    return out
+
+
+def list_ce_skills() -> list[str]:
+    """List all vendored skill names."""
+    skills_dir = os.path.join(CE_VENDOR_DIR, "skills")
+    if not os.path.isdir(skills_dir):
+        return []
+    return sorted(
+        d for d in os.listdir(skills_dir)
+        if os.path.isfile(os.path.join(skills_dir, d, "SKILL.md"))
+    )
+
+
+def get_ce_prompt(mode: str) -> str:
+    """Return the system prompt body for /ce:<mode>.
+
+    Resolution order:
+      1. Vendored skill (CE_MODE_TO_SKILL[mode] -> SKILL.md body + host adapter)
+      2. Legacy inline CE_PROMPTS dict (paraphrased fallback for any mode
+         that loses its vendor file mid-refresh)
+    """
+    skill_name = CE_MODE_TO_SKILL.get(mode)
+    if skill_name:
+        skill = load_ce_skill(skill_name)
+        if skill and skill.get("body"):
+            return skill["body"] + CE_HOST_ADAPTATION
+    return CE_PROMPTS.get(mode, "")
+
+
+def all_ce_modes() -> list[str]:
+    """Union of vendored skill modes and legacy inline modes, longest-first.
+
+    Sorting longest-first ensures that prefix matching in the slash-command
+    handler picks /ce:commit-push-pr before /ce:commit, /ce:doc-review
+    before /ce:debug, etc.
+    """
+    modes = set(CE_MODE_TO_SKILL.keys()) | set(CE_PROMPTS.keys())
+    # ce_mode availability requires either a vendored skill or a legacy prompt.
+    available = [m for m in modes if get_ce_prompt(m)]
+    return sorted(available, key=lambda m: (-len(m), m))
+
+
+# ── Compound Engineering Workflow Prompts (legacy fallback) ─────────────────
+#
+# These inline prompts predate the vendor loader. They remain as a safety
+# net for any /ce:<mode> whose vendored SKILL.md is missing or fails to
+# parse. New work should add to compound-engineering/skills/ instead.
 
 CE_PROMPTS = {
     "brainstorm": """You are now in BRAINSTORM mode. Your job is to explore requirements and approaches through collaborative dialogue before writing code.
@@ -1462,11 +1851,11 @@ Workflow:
    - What was the root cause?
    - What was the solution?
    - What patterns/gotchas should be remembered?
-5. Write each learning using ce_write_learning (this updates compound-engineering.local.md)
+5. Write each learning using ce_write_learning (this updates .compound-engineering/learnings.md)
 6. If working from a review doc, use ce_mark_step to check off each finding as you process it
 7. Check if existing learnings need updating -- use ce_read_learnings and look for entries that should be revised or merged
 8. Save a solution summary using ce_save_doc(doc_type="solution", content=...)
-9. IMPORTANT: After writing solution docs, always update compound-engineering.local.md with key learnings so other modes can reference them without scanning solution files
+9. IMPORTANT: After writing solution docs, always update .compound-engineering/learnings.md with key learnings so other modes can reference them without scanning solution files
 
 RESUMABILITY: If working through a review document, mark each finding complete with ce_mark_step as you process it. This way, if interrupted, the next /ce:compound invocation will resume from where you left off.
 
@@ -1524,6 +1913,110 @@ Guidelines:
 
 # ── API Calls ────────────────────────────────────────────────────────────────
 
+# Path to the oMLX server start script (lives next to this agent file).
+_OMLX_START_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-omlx.sh")
+_OMLX_RESTART_LOG = "/tmp/omlx-server-restart.log"
+_omlx_restart_in_progress = False
+_omlx_last_restart_ts = 0.0
+
+
+def _is_connection_refused(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "connection refused" in text
+        or "errno 61" in text
+        or "remote end closed" in text
+        or "connection reset" in text
+        or "incompleteread" in text
+        or "broken pipe" in text
+    )
+
+
+def _omlx_server_alive(timeout: float = 3.0) -> bool:
+    try:
+        req = urllib.request.Request(
+            f"{API_URL}/models",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1)
+            return True
+    except Exception:
+        return False
+
+
+def _restart_omlx_server(max_wait: float = 90.0) -> bool:
+    """Restart the oMLX server via start-omlx.sh and wait for it to accept requests."""
+    global _omlx_restart_in_progress, _omlx_last_restart_ts, _omlx_session_cookie
+    _p = tui_print if _tui_instance else print
+
+    if _omlx_restart_in_progress:
+        # Another caller is already restarting; just wait for it.
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            if _omlx_server_alive():
+                return True
+            time.sleep(1.0)
+        return _omlx_server_alive()
+
+    # Cooldown: don't thrash if we just restarted.
+    if time.time() - _omlx_last_restart_ts < 15.0:
+        return _omlx_server_alive()
+
+    if not os.path.isfile(_OMLX_START_SCRIPT):
+        _p(f"[oMLX restart aborted: {_OMLX_START_SCRIPT} not found]", C_RED if _tui_instance else 0)
+        return False
+
+    _omlx_restart_in_progress = True
+    try:
+        _p("[oMLX server unreachable - attempting restart via start-omlx.sh]",
+           C_YELLOW if _tui_instance else 0)
+        # Best-effort: kill any straggling omlx process so the new one can bind :8000.
+        try:
+            subprocess.run(
+                ["pkill", "-f", "omlx serve"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+        try:
+            log_fh = open(_OMLX_RESTART_LOG, "ab")
+        except Exception:
+            log_fh = subprocess.DEVNULL
+        try:
+            subprocess.Popen(
+                ["/bin/bash", _OMLX_START_SCRIPT],
+                stdout=log_fh, stderr=log_fh,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=os.path.dirname(_OMLX_START_SCRIPT),
+            )
+        except Exception as exc:
+            _p(f"[oMLX restart failed to spawn: {exc}]", C_RED if _tui_instance else 0)
+            return False
+
+        # Invalidate any cached admin session.
+        _omlx_session_cookie = None
+
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            if _omlx_server_alive():
+                _omlx_last_restart_ts = time.time()
+                _p("[oMLX server restarted successfully]",
+                   C_GREEN if _tui_instance else 0)
+                return True
+            time.sleep(2.0)
+
+        _p(f"[oMLX server did not come back within {int(max_wait)}s - see {_OMLX_RESTART_LOG}]",
+           C_RED if _tui_instance else 0)
+        return False
+    finally:
+        _omlx_restart_in_progress = False
+
+
 def api_call(messages: list, model: str) -> dict:
     payload = {
         "model": model,
@@ -1532,17 +2025,20 @@ def api_call(messages: list, model: str) -> dict:
         "max_tokens": MAX_TOKENS,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{API_URL}/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}",
-        },
-    )
-    try:
+    def _do_request():
+        req = urllib.request.Request(
+            f"{API_URL}/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}",
+            },
+        )
         with urllib.request.urlopen(req, timeout=300) as resp:
             return json.loads(resp.read())
+
+    try:
+        return _do_request()
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         _p = tui_print if _tui_instance else print
@@ -1553,6 +2049,14 @@ def api_call(messages: list, model: str) -> dict:
         return None
     except Exception as e:
         _p = tui_print if _tui_instance else print
+        if _is_connection_refused(e):
+            _p(f"[oMLX connection lost: {e}]", C_YELLOW if _tui_instance else 0)
+            if _restart_omlx_server():
+                try:
+                    return _do_request()
+                except Exception as e2:
+                    _p(f"Connection error after restart: {e2}", C_RED)
+                    return None
         _p(f"Connection error: {e}", C_RED)
         return None
 
@@ -1579,20 +2083,34 @@ def _omlx_admin_login() -> str | None:
     if _omlx_session_cookie:
         return _omlx_session_cookie
     payload = json.dumps({"api_key": API_KEY, "remember": True}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{API_URL.replace('/v1', '')}/admin/api/login",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
+
+    def _attempt():
+        req = urllib.request.Request(
+            f"{API_URL.replace('/v1', '')}/admin/api/login",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             for header in resp.headers.get_all("Set-Cookie") or []:
                 if "omlx_admin_session=" in header:
-                    _omlx_session_cookie = header.split("omlx_admin_session=")[1].split(";")[0]
-                    return _omlx_session_cookie
-    except Exception:
-        pass
+                    return header.split("omlx_admin_session=")[1].split(";")[0]
+        return None
+
+    try:
+        cookie = _attempt()
+        if cookie:
+            _omlx_session_cookie = cookie
+            return cookie
+    except Exception as e:
+        if _is_connection_refused(e) and _restart_omlx_server():
+            try:
+                cookie = _attempt()
+                if cookie:
+                    _omlx_session_cookie = cookie
+                    return cookie
+            except Exception:
+                pass
     return None
 
 def set_omlx_settings(settings: dict) -> bool:
@@ -1670,7 +2188,24 @@ CE_MODE_TO_GROUP = {
     "work": "work",
     "debug": "work",
     "review": "review",
+    "code-review": "review",
+    "doc-review": "review",
     "compound": "compound",
+    "compound-refresh": "compound",
+    "commit": "work",
+    "pr-description": "work",
+    "commit-push-pr": "work",
+    "setup": "work",
+    "test-browser": "work",
+    "worktree": "work",
+    "clean-gone-branches": "work",
+    "optimize": "work",
+    "sessions": "work",
+    "demo-reel": "work",
+    "report-bug": "work",
+    "resolve-pr-feedback": "review",
+    "polish-beta": "review",
+    "lfg": "manager",
 }
 
 # Ordered list of model groups for startup selection
@@ -2151,6 +2686,88 @@ def agent_turn(messages: list, model: str) -> str:
     return "[Max tool rounds reached]"
 
 
+# ── CE Sub-agent Dispatch ────────────────────────────────────────────────────
+
+# Cap sub-agent transcripts to prevent runaway loops in nested dispatches.
+_CE_SUBAGENT_MAX_DEPTH = 3
+_ce_subagent_depth = 0
+
+
+def run_ce_subagent(agent_name: str, task: str, model: str | None = None) -> str:
+    """Run a vendored CE sub-agent in an isolated conversation.
+
+    Loads the agent's body from compound-engineering/agents/<agent_name>.agent.md,
+    appends the omlx_agent host adaptation footer, builds a fresh messages
+    list, and runs it through agent_turn(). Returns the agent's final
+    text/JSON output.
+
+    The sub-agent gets the omlx_agent tool surface (read_file, write_file,
+    run_command, etc.) plus ce_run_agent itself for nested dispatch up to
+    _CE_SUBAGENT_MAX_DEPTH levels.
+    """
+    global _ce_subagent_depth
+    if _ce_subagent_depth >= _CE_SUBAGENT_MAX_DEPTH:
+        return f"[ce_run_agent refused: max sub-agent depth ({_CE_SUBAGENT_MAX_DEPTH}) reached]"
+
+    agent = load_ce_agent(agent_name)
+    if agent is None:
+        available = ", ".join(list_ce_agents()[:20])
+        return f"[ce_run_agent error: agent '{agent_name}' not found in {CE_VENDOR_DIR}/agents/. Available (first 20): {available}]"
+
+    # Resolve model: caller-specified > inherit from active model > fallback.
+    if model is None:
+        if _tui_instance is not None:
+            try:
+                model = _tui_instance.active_model
+            except Exception:
+                model = None
+    if not model:
+        return "[ce_run_agent error: no model available; pass model= or run inside an active TUI session]"
+
+    system_prompt = agent["body"] + CE_HOST_ADAPTATION
+    sub_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": task},
+    ]
+
+    _p = tui_print if _tui_instance else print
+    _ts = datetime.now().strftime("%H:%M:%S")
+    _p(f"[{_ts}] [ce_run_agent -> {agent_name} (depth {_ce_subagent_depth + 1})]",
+       C_MAGENTA if _tui_instance else 0)
+
+    _ce_subagent_depth += 1
+    try:
+        result = agent_turn(sub_messages, model)
+    finally:
+        _ce_subagent_depth -= 1
+
+    return result
+
+
+def tool_ce_run_agent(agent_name: str, task: str) -> str:
+    """TOOL_DISPATCH entry for ce_run_agent."""
+    if not isinstance(agent_name, str) or not agent_name:
+        return "ERROR: agent_name is required"
+    if not isinstance(task, str) or not task.strip():
+        return "ERROR: task is required (pass full context for the sub-agent)"
+    return run_ce_subagent(agent_name, task)
+
+
+def tool_ce_list_agents() -> str:
+    """TOOL_DISPATCH entry for ce_list_agents."""
+    names = list_ce_agents()
+    if not names:
+        return f"No CE agents found in {CE_VENDOR_DIR}/agents/"
+    lines = [f"Available CE sub-agents ({len(names)}):"]
+    for name in names:
+        agent = load_ce_agent(name)
+        desc = (agent.get("description") or "").strip().replace("\n", " ") if agent else ""
+        if len(desc) > 140:
+            desc = desc[:137] + "..."
+        lines.append(f"  {name}: {desc}" if desc else f"  {name}")
+    return "\n".join(lines)
+
+
 def print_help():
     print("""
 \033[1mCommands:\033[0m
@@ -2160,16 +2777,24 @@ def print_help():
   /quit               Exit
 
 \033[1mCompound Engineering:\033[0m
-  /ce:brainstorm      Explore ideas and requirements
-  /ce:plan            Create a structured implementation plan
-  /ce:work            Execute work with task tracking
-  /ce:review          Multi-perspective code review
-  /ce:compound        Document learnings from recent work
-  /ce:debug           Systematic bug investigation
-  /ce:ideate          Discover project improvements
-  /ce:done            Exit current CE mode
-  /ce:learnings       View all project learnings
-  /ce:todos           View current todo list
+  /ce:brainstorm        Explore ideas and requirements
+  /ce:plan              Create a structured implementation plan
+  /ce:work              Execute work with task tracking
+  /ce:review            Tiered persona code review (vendored ce-code-review)
+  /ce:doc-review        Persona-based requirements/plan document review
+  /ce:compound          Document learnings from recent work
+  /ce:compound-refresh  Age out, replace, or archive stale learnings
+  /ce:debug             Systematic bug investigation
+  /ce:ideate            Discover project improvements
+  /ce:commit            Value-first git commit
+  /ce:pr-description    Generate a PR title and body
+  /ce:commit-push-pr    Commit, push, and open a PR
+  /ce:setup             Diagnose env and bootstrap project config
+  /ce:test-browser      Run browser tests on PR-affected pages
+  /ce:flow              Autonomous brainstorm -> plan -> work -> review -> compound
+  /ce:done              Exit current CE mode
+  /ce:learnings         View all project learnings
+  /ce:todos             View current todo list
   /help               Show this help
 """)
 
@@ -2212,6 +2837,7 @@ class AgentTUI:
         self.active_ce_mode = active_ce_mode
         self.models = models or []
         self.workflow_state = CEWorkflowState()
+        self._ce_setup_warned = False  # session flag: have we surfaced the /ce:setup nag yet
 
         # Output
         self.output_lines = []  # list of (str, color_pair_num)
@@ -3658,7 +4284,7 @@ class AgentTUI:
         # CE workflow commands -- match /ce:cmd at start, as prefix, or inline
         ce_cmd = None
         ce_extra = ""
-        for cmd_name in CE_PROMPTS:
+        for cmd_name in all_ce_modes():
             if text == f"/ce:{cmd_name}":
                 ce_cmd = cmd_name
                 break
@@ -3673,8 +4299,19 @@ class AgentTUI:
                 break
 
         if ce_cmd:
+            # Nag (once per session) if /ce:setup hasn't been completed for this repo,
+            # but never block the command and never nag /ce:setup itself.
+            if ce_cmd != "setup" and not self._ce_setup_warned:
+                try:
+                    _status = ce_setup_status(WORK_DIR)
+                    if not _status["ok"]:
+                        for _ln in format_ce_setup_warning(_status):
+                            self.add_output(_ln, C_YELLOW)
+                        self._ce_setup_warned = True
+                except Exception:
+                    pass
             self.active_ce_mode = ce_cmd
-            mode_prompt = CE_PROMPTS[ce_cmd]
+            mode_prompt = get_ce_prompt(ce_cmd)
             self.messages.append({
                 "role": "system",
                 "content": f"[Entering {ce_cmd.upper()} mode]\n{mode_prompt}",
@@ -3864,7 +4501,7 @@ class AgentTUI:
         actually finished the user's request. Returns None to accept completion.
         """
         # Cap the number of completion rejections so we cannot loop forever.
-        if self.workflow_state.rejected_completions >= 3:
+        if self.workflow_state.rejected_completions >= 1:
             return None
 
         deterministic = _deterministic_completion_block(self.workflow_state)
@@ -3914,8 +4551,8 @@ class AgentTUI:
         }
 
     def _run_phase_from_flow(self, phase: str, phase_input: str) -> str:
-        actual_phase = "plan" if phase == "deepen_plan" else phase
-        mode_prompt = CE_PROMPTS[actual_phase]
+        actual_phase = _phase_to_ce_mode(phase)
+        mode_prompt = get_ce_prompt(actual_phase)
         handoff = _build_manager_handoff(self.workflow_state.manager_messages, phase, phase_input)
         manager_model = self.model_groups["manager"]["model"]
         target_model = self.model_groups[CE_MODE_TO_GROUP[actual_phase]]["model"]
@@ -4264,6 +4901,18 @@ class AgentTUI:
         self.add_output("Type /help for commands. Start typing to chat.", C_DIM)
         self.add_output("-" * 60, C_DIM)
 
+        # One-time /ce:setup detection: surface a yellow banner if the repo
+        # has not been bootstrapped via the vendored ce-setup skill.
+        try:
+            _setup_status = ce_setup_status(WORK_DIR)
+            if not _setup_status["ok"]:
+                for _ln in format_ce_setup_warning(_setup_status):
+                    self.add_output(_ln, C_YELLOW)
+                self.add_output("-" * 60, C_DIM)
+                self._ce_setup_warned = True
+        except Exception as _exc:
+            self.add_output(f"[ce:setup detect] {_exc}", C_DIM)
+
         # Start memory monitoring background thread
         self._start_memory_monitor()
 
@@ -4314,17 +4963,24 @@ HELP_TEXT = """Commands:
   /quit               Exit (also Ctrl+D)
 
 Compound Engineering:
-    /ce:flow            Manager-run CE flow across brainstorm, plan, work, review, compound
-  /ce:brainstorm      Explore ideas and requirements
-  /ce:plan            Create a structured implementation plan
-  /ce:work            Execute work with task tracking
-  /ce:review          Multi-perspective code review
-  /ce:compound        Document learnings from recent work
-  /ce:debug           Systematic bug investigation
-  /ce:ideate          Discover project improvements
-  /ce:done            Exit current CE mode
-  /ce:learnings       View all project learnings
-  /ce:todos           View current todo list
+    /ce:flow              Manager-run CE flow across brainstorm, plan, work, review, compound
+  /ce:brainstorm        Explore ideas and requirements
+  /ce:plan              Create a structured implementation plan
+  /ce:work              Execute work with task tracking
+  /ce:review            Tiered persona code review (vendored ce-code-review)
+  /ce:doc-review        Persona-based requirements/plan document review
+  /ce:compound          Document learnings from recent work
+  /ce:compound-refresh  Age out, replace, or archive stale learnings
+  /ce:debug             Systematic bug investigation
+  /ce:ideate            Discover project improvements
+  /ce:commit            Value-first git commit
+  /ce:pr-description    Generate a PR title and body
+  /ce:commit-push-pr    Commit, push, and open a PR
+  /ce:setup             Diagnose env and bootstrap project config
+  /ce:test-browser      Run browser tests on PR-affected pages
+  /ce:done              Exit current CE mode
+  /ce:learnings         View all project learnings
+  /ce:todos             View current todo list
 
 While Agent is Working:
   Ctrl+S              Stop & Send (interrupt, send your message)
@@ -4486,6 +5142,18 @@ def _main_plain(model_config, messages, models):
     print("\nType /help for commands. Start typing to chat.")
     print("-" * 60)
 
+    # One-time /ce:setup detection banner.
+    _ce_setup_warned = [False]
+    try:
+        _setup_status = ce_setup_status(WORK_DIR)
+        if not _setup_status["ok"]:
+            for _ln in format_ce_setup_warning(_setup_status):
+                print(f"\033[33m{_ln}\033[0m")
+            print("-" * 60)
+            _ce_setup_warned[0] = True
+    except Exception as _exc:
+        print(f"[ce:setup detect] {_exc}")
+
     active_ce_mode = None
     workflow_state = CEWorkflowState()
     _current_model_name = None
@@ -4509,7 +5177,7 @@ def _main_plain(model_config, messages, models):
 
     def _run_plain_phase_from_flow(phase: str, phase_input: str, manager_messages: list) -> str:
         nonlocal active_ce_mode, _current_model_name
-        actual_phase = "plan" if phase == "deepen_plan" else phase
+        actual_phase = _phase_to_ce_mode(phase)
         handoff = _build_manager_handoff(manager_messages, phase, phase_input)
         manager_model = model_config["manager"]["model"]
         target_model = model_config[CE_MODE_TO_GROUP[actual_phase]]["model"]
@@ -4521,7 +5189,7 @@ def _main_plain(model_config, messages, models):
         active_ce_mode = actual_phase
         messages.append({
             "role": "system",
-            "content": f"[Entering {phase.upper()} via FLOW manager]\n{CE_PROMPTS[actual_phase]}",
+            "content": f"[Entering {phase.upper()} via FLOW manager]\n{get_ce_prompt(actual_phase)}",
         })
         messages.append({"role": "system", "content": handoff})
         messages.append({"role": "user", "content": phase_input})
@@ -4532,7 +5200,7 @@ def _main_plain(model_config, messages, models):
 
     def _verify_plain_completion(workflow_state: CEWorkflowState, decision: dict) -> dict | None:
         nonlocal active_ce_mode, _current_model_name
-        if workflow_state.rejected_completions >= 3:
+        if workflow_state.rejected_completions >= 1:
             return None
         deterministic = _deterministic_completion_block(workflow_state)
         if deterministic is not None:
@@ -4798,7 +5466,7 @@ def _main_plain(model_config, messages, models):
 
         ce_cmd = None
         ce_extra = ""
-        for cmd_name in CE_PROMPTS:
+        for cmd_name in all_ce_modes():
             if user_input == f"/ce:{cmd_name}":
                 ce_cmd = cmd_name
                 break
@@ -4813,8 +5481,17 @@ def _main_plain(model_config, messages, models):
                 break
 
         if ce_cmd:
+            if ce_cmd != "setup" and not _ce_setup_warned[0]:
+                try:
+                    _status = ce_setup_status(WORK_DIR)
+                    if not _status["ok"]:
+                        for _ln in format_ce_setup_warning(_status):
+                            print(f"\033[33m{_ln}\033[0m")
+                        _ce_setup_warned[0] = True
+                except Exception:
+                    pass
             active_ce_mode = ce_cmd
-            mode_prompt = CE_PROMPTS[ce_cmd]
+            mode_prompt = get_ce_prompt(ce_cmd)
             messages.append({
                 "role": "system",
                 "content": f"[Entering {ce_cmd.upper()} mode]\n{mode_prompt}",
