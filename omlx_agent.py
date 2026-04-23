@@ -2589,7 +2589,11 @@ def agent_turn(messages: list, model: str) -> str:
             })
             if text:
                 _ts = datetime.now().strftime("%H:%M:%S")
-                print(f"\n\033[33m[{_ts}] {text}\033[0m")
+                _p = tui_print if _tui_instance else print
+                if _tui_instance:
+                    _p(f"[{_ts}] {text}", C_YELLOW)
+                else:
+                    _p(f"\n\033[33m[{_ts}] {text}\033[0m")
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 name = fn.get("name")
@@ -2611,7 +2615,11 @@ def agent_turn(messages: list, model: str) -> str:
             display_text = re.sub(r'<tool_(?:call|use)>.*$', '', display_text, flags=re.DOTALL).strip()
             if display_text:
                 _ts = datetime.now().strftime("%H:%M:%S")
-                print(f"\n\033[33m[{_ts}] {display_text}\033[0m")
+                _p = tui_print if _tui_instance else print
+                if _tui_instance:
+                    _p(f"[{_ts}] {display_text}", C_YELLOW)
+                else:
+                    _p(f"\n\033[33m[{_ts}] {display_text}\033[0m")
 
             # Execute the parsed tool calls
             tool_results = []
