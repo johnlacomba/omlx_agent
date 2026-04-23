@@ -576,6 +576,543 @@ def _rebuild_messages_with_snapshot(
     rebuilt.extend(tail)
     return rebuilt
 
+
+# ── Tag taxonomy and dump file format (U3) ───────────────────────────────────
+# On-disk archive of pre-checkpoint message lists with section anchors and
+# per-section tag headers. The contextID-scoped index.md is load-bearing for
+# the U4 recall_context tool: tag -> [{file, anchor}] lookups happen there.
+#
+# Layout (under WORK_DIR):
+#   .currentContext/
+#       contextTags.md                       # master taxonomy
+#       YYYY-MM-DD/
+#           HHMMSS-xxxx/                     # one per user-minted contextID
+#               dump-HHMMSS.md
+#               index.md
+
+CURRENT_CONTEXT_DIR = ".currentContext"
+CONTEXT_TAGS_FILE = "contextTags.md"
+SECTION_SPLIT_TOKEN_THRESHOLD = 2000  # split a single message into multiple sections beyond this
+
+
+def _context_root(work_dir: str | None = None) -> str:
+    """Absolute path to the .currentContext root for ``work_dir`` (default WORK_DIR)."""
+    base = work_dir if work_dir is not None else WORK_DIR
+    return os.path.join(base, CURRENT_CONTEXT_DIR)
+
+
+def _master_tags_path(work_dir: str | None = None) -> str:
+    return os.path.join(_context_root(work_dir), CONTEXT_TAGS_FILE)
+
+
+def _context_dir_for_id(context_id: str, *, work_dir: str | None = None,
+                       date_str: str | None = None) -> str:
+    """Directory `<root>/YYYY-MM-DD/<context_id>/` for a given contextID."""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(_context_root(work_dir), date_str, context_id)
+
+
+def _anchor_for(idx: int) -> str:
+    """Return the section anchor id for the 1-based section index ``idx``."""
+    return f"s-{idx:03d}"
+
+
+def _split_messages_into_sections(messages: list) -> list[dict]:
+    """Group messages into role-coherent sections.
+
+    A section is a list of consecutive messages anchored on a single assistant
+    turn: the assistant message plus any directly preceding user/tool messages
+    it answered. Leading system messages each form their own section so the
+    snapshot context (system role) stays addressable.
+
+    If a single message exceeds SECTION_SPLIT_TOKEN_THRESHOLD tokens, it is
+    split into multiple sections of roughly that size (so each anchor stays
+    independently tag-able).
+
+    Returns a list of dicts: {"role": str, "messages": [...], "preview": str}
+    where ``preview`` is the first ~200 chars of the section body for tag
+    suggestion prompts.
+    """
+    sections: list[dict] = []
+    if not messages:
+        return sections
+
+    pending: list[dict] = []  # user/tool messages buffered until next assistant
+
+    def _emit(role: str, msgs: list[dict]) -> None:
+        if not msgs:
+            return
+        body = _section_body_text(msgs)
+        # Token-budget split.
+        if _estimate_tokens(body) <= SECTION_SPLIT_TOKEN_THRESHOLD:
+            sections.append({"role": role, "messages": list(msgs),
+                             "preview": body[:200]})
+            return
+        # Oversized: chop the body into ~SECTION_SPLIT_TOKEN_THRESHOLD chunks,
+        # represent each chunk as its own section. Original messages are kept
+        # together in the first chunk's `messages` list so retrieval can read
+        # the underlying source if needed.
+        chunk_chars = SECTION_SPLIT_TOKEN_THRESHOLD * 4
+        chunks = [body[i:i + chunk_chars] for i in range(0, len(body), chunk_chars)]
+        for chunk_i, chunk in enumerate(chunks):
+            sections.append({
+                "role": role,
+                "messages": list(msgs) if chunk_i == 0 else [],
+                "preview": chunk[:200],
+                "split_chunk": chunk_i,
+                "split_total": len(chunks),
+                "body_override": chunk,
+            })
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            _emit("system", [m])
+            continue
+        if role in ("user", "tool"):
+            pending.append(m)
+            continue
+        if role == "assistant":
+            group = pending + [m]
+            pending = []
+            _emit("assistant", group)
+            continue
+        # Unknown role: emit as its own section to avoid losing it.
+        _emit(role or "unknown", [m])
+
+    # Any trailing user/tool messages without an assistant reply still need an
+    # anchor so they can be archived and tagged.
+    if pending:
+        _emit(pending[-1].get("role") or "user", pending)
+
+    return sections
+
+
+def _section_body_text(msgs: list[dict]) -> str:
+    """Render a list of messages as plain text for tag-suggestion + previews."""
+    lines: list[str] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "?")
+        content = m.get("content")
+        body = ""
+        if isinstance(content, str):
+            body = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    t = item.get("text") or item.get("content") or ""
+                    if isinstance(t, str):
+                        parts.append(t)
+            body = "\n".join(parts)
+        lines.append(f"[{role}] {body}".rstrip())
+        # Tool calls: render their function name + arguments preview.
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                lines.append(
+                    f"[{role}.tool_call] {fn.get('name', '')}"
+                    f"({fn.get('arguments', '')})"
+                )
+        if m.get("tool_call_id"):
+            lines.append(f"[tool_call_id] {m['tool_call_id']}")
+    return "\n".join(lines).strip()
+
+
+def _render_dump_markdown(
+    *,
+    context_id: str,
+    sections: list[dict],
+    tags_by_section: dict[str, list[str]],
+    timestamp: str | None = None,
+) -> str:
+    """Render a dump file as markdown.
+
+    Top of file: contextID + timestamp metadata, then a `## Section Tags`
+    table mapping `tag -> [s-001, s-014]` so the index can be rebuilt from
+    just the dump if needed. Then one fenced section per anchor.
+    """
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    out: list[str] = []
+    out.append(f"# Context Dump {context_id}")
+    out.append(f"_generated: {timestamp}_")
+    out.append("")
+    out.append("## Section Tags")
+    # Build inverse: tag -> [anchors]
+    tag_to_anchors: dict[str, list[str]] = {}
+    for anchor, tags in tags_by_section.items():
+        for tag in tags:
+            tag_to_anchors.setdefault(tag, []).append(anchor)
+    if not tag_to_anchors:
+        out.append("_(no tags)_")
+    else:
+        for tag in sorted(tag_to_anchors):
+            anchors = sorted(set(tag_to_anchors[tag]))
+            out.append(f"- `{tag}` -> {', '.join(anchors)}")
+    out.append("")
+    out.append("## Sections")
+    out.append("")
+    for idx, sec in enumerate(sections, start=1):
+        anchor = _anchor_for(idx)
+        section_tags = tags_by_section.get(anchor, [])
+        out.append(f'<a id="{anchor}"></a>')
+        out.append(f"### {anchor} role: {sec.get('role', '?')}")
+        if "split_chunk" in sec:
+            out.append(
+                f"_split chunk {sec['split_chunk'] + 1}/{sec['split_total']}_"
+            )
+        if section_tags:
+            out.append(f"**tags:** {', '.join(section_tags)}")
+        else:
+            out.append("**tags:** _(none)_")
+        out.append("")
+        out.append("```text")
+        body = sec.get("body_override")
+        if body is None:
+            body = _section_body_text(sec.get("messages", []))
+        out.append(body)
+        out.append("```")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _load_master_tags(work_dir: str | None = None) -> set[str]:
+    """Read the master taxonomy file and return the set of canonical tags.
+
+    File format: one tag per line, optionally followed by ` # description`.
+    Lines beginning with `## added:` or `## normalized:` are metadata and
+    contribute the tag mentioned in the `## added: <tag> -- <reason>` form to
+    the canonical set (so once-added tags are remembered).
+    Malformed files (e.g. binary garbage) are treated as empty rather than
+    raising — the dump path must never crash on a corrupt taxonomy file.
+    """
+    path = _master_tags_path(work_dir)
+    if not os.path.isfile(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return set()
+    tags: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("## added:"):
+            # `## added: <tag> -- <reason>`
+            rest = line[len("## added:"):].strip()
+            if "--" in rest:
+                tag = rest.split("--", 1)[0].strip()
+            else:
+                tag = rest.strip()
+            if tag and _is_valid_tag(tag):
+                tags.add(tag)
+            continue
+        if line.startswith("## normalized:") or line.startswith("#"):
+            # Metadata line (or a markdown comment). Skip.
+            continue
+        # Strip optional inline description.
+        if " # " in line:
+            tag = line.split(" # ", 1)[0].strip()
+        else:
+            tag = line
+        if tag and _is_valid_tag(tag):
+            tags.add(tag)
+    return tags
+
+
+def _is_valid_tag(tag: str) -> bool:
+    """A tag is a short, single-line, mostly-printable token."""
+    if not tag or len(tag) > 80:
+        return False
+    if "\n" in tag or "\r" in tag:
+        return False
+    # Reject anything that looks like binary or HTML markup garbage.
+    return all(c.isprintable() and c not in "<>" for c in tag)
+
+
+def _append_master_tags(
+    new_tags: list[tuple[str, str]],
+    *,
+    work_dir: str | None = None,
+) -> list[str]:
+    """Atomically append `## added: <tag> -- <reason>` lines for new tags.
+
+    ``new_tags`` is a list of ``(tag, reason)`` pairs. Tags already present in
+    the master set are skipped. Returns the list of tags actually appended.
+    """
+    accepted: list[str] = []
+    if not new_tags:
+        return accepted
+    existing = _load_master_tags(work_dir)
+    additions: list[str] = []
+    for tag, reason in new_tags:
+        if not _is_valid_tag(tag):
+            continue
+        if tag in existing:
+            continue
+        reason_clean = (reason or "").strip().replace("\n", " ").replace("\r", " ")
+        if not reason_clean:
+            reason_clean = "(no reason given)"
+        additions.append(f"## added: {tag} -- {reason_clean}")
+        accepted.append(tag)
+    if not additions:
+        return accepted
+    path = _master_tags_path(work_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Read existing file (if any) and append; write to .tmp then os.replace.
+    prior = ""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                prior = f.read()
+        except OSError:
+            prior = ""
+    if prior and not prior.endswith("\n"):
+        prior += "\n"
+    if not prior:
+        prior = "# Context Tags Master Taxonomy\n\n"
+    new_text = prior + "\n".join(additions) + "\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, path)
+    return accepted
+
+
+def _request_section_tags(
+    sections: list[dict],
+    master_tags: set[str],
+    model: str,
+    *,
+    api_call_fn=None,
+) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
+    """Ask ``model`` to assign tags to each section.
+
+    Returns ``(tags_by_section, new_tags)`` where:
+      - ``tags_by_section`` maps anchor -> list of tag strings
+      - ``new_tags`` is a list of ``(tag, reason)`` pairs the model proposed
+        as additions to the master taxonomy.
+
+    On any parse failure or empty model response, returns empty dicts rather
+    than raising — the caller writes the dump regardless (anchors with empty
+    tag lists are still indexable by anchor for direct retrieval).
+    """
+    if api_call_fn is None:
+        api_call_fn = api_call
+    if not sections:
+        return {}, []
+
+    # Build a compact prompt enumerating sections + master tag list.
+    section_lines = []
+    anchors: list[str] = []
+    for idx, sec in enumerate(sections, start=1):
+        anchor = _anchor_for(idx)
+        anchors.append(anchor)
+        preview = sec.get("preview", "")
+        section_lines.append(
+            f"### {anchor} (role: {sec.get('role', '?')})\n{preview}"
+        )
+    master_list = sorted(master_tags)
+
+    instructions = (
+        "You are tagging conversation sections so they can be retrieved later "
+        "by tag. Follow these rules strictly:\n"
+        "1. Prefer tags from the EXISTING TAGS list when applicable.\n"
+        "2. Only propose a NEW tag if no existing tag fits.\n"
+        "3. Each new tag MUST come with a one-line justification.\n"
+        "4. Tags are short (1-3 words), lowercase, hyphen-separated.\n"
+        "5. Output VALID JSON ONLY, matching this schema exactly:\n"
+        '   {"sections": {"s-001": ["tag1", "tag2"], ...}, '
+        '"new_tags": [{"tag": "...", "reason": "..."}]}\n'
+        "Do not call any tools. Do not include explanation prose."
+    )
+    user_msg = (
+        f"EXISTING TAGS:\n{', '.join(master_list) if master_list else '(none)'}\n\n"
+        f"SECTIONS TO TAG:\n" + "\n\n".join(section_lines)
+    )
+    response = api_call_fn(
+        [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": user_msg},
+        ],
+        model,
+        tools=[],
+    )
+    if not response or response.get("_context_overflow"):
+        return {a: [] for a in anchors}, []
+    parsed = normalize_api_response(response)
+    text = (parsed.get("text") or "").strip()
+    payload = _safe_extract_json_object(text)
+    if not isinstance(payload, dict):
+        return {a: [] for a in anchors}, []
+
+    raw_sections = payload.get("sections") or {}
+    tags_by_section: dict[str, list[str]] = {}
+    if isinstance(raw_sections, dict):
+        for anchor in anchors:
+            entry = raw_sections.get(anchor) or []
+            cleaned: list[str] = []
+            if isinstance(entry, list):
+                for t in entry:
+                    if isinstance(t, str):
+                        tag = t.strip().lower()
+                        if _is_valid_tag(tag):
+                            cleaned.append(tag)
+            tags_by_section[anchor] = cleaned
+
+    raw_new = payload.get("new_tags") or []
+    new_tags: list[tuple[str, str]] = []
+    if isinstance(raw_new, list):
+        for entry in raw_new:
+            if isinstance(entry, dict):
+                tag = (entry.get("tag") or "").strip().lower()
+                reason = (entry.get("reason") or "").strip()
+                if _is_valid_tag(tag) and tag not in master_tags:
+                    new_tags.append((tag, reason))
+    return tags_by_section, new_tags
+
+
+def _safe_extract_json_object(text: str) -> dict | None:
+    """Best-effort parse of a JSON object from a model response.
+
+    Tries the whole string first, then falls back to the substring between
+    the first ``{`` and the last ``}``.
+    """
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _read_index(index_path: str) -> dict[str, list[dict]]:
+    """Read a contextID-scoped index.md and return tag -> [{file, anchor}]."""
+    if not os.path.isfile(index_path):
+        return {}
+    try:
+        with open(index_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    try:
+        # Index is stored as JSON inside a fenced code block for human read +
+        # machine parse. Fallback: try parsing the whole file as JSON.
+        if "```json" in text:
+            body = text.split("```json", 1)[1].split("```", 1)[0]
+        else:
+            body = text
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            return {}
+        result: dict[str, list[dict]] = {}
+        for tag, hits in data.items():
+            if isinstance(tag, str) and isinstance(hits, list):
+                cleaned: list[dict] = []
+                for hit in hits:
+                    if isinstance(hit, dict) and hit.get("file") and hit.get("anchor"):
+                        cleaned.append({"file": str(hit["file"]),
+                                        "anchor": str(hit["anchor"])})
+                if cleaned:
+                    result[tag] = cleaned
+        return result
+    except (json.JSONDecodeError, IndexError):
+        return {}
+
+
+def _write_index(index_path: str, index: dict[str, list[dict]]) -> None:
+    """Write a contextID-scoped index.md atomically."""
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    # Sort tags + dedupe hits for stable diffs.
+    normalized: dict[str, list[dict]] = {}
+    for tag in sorted(index):
+        seen: set[tuple[str, str]] = set()
+        ordered: list[dict] = []
+        for hit in index[tag]:
+            key = (hit.get("file", ""), hit.get("anchor", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append({"file": hit.get("file", ""),
+                            "anchor": hit.get("anchor", "")})
+        normalized[tag] = ordered
+    body = json.dumps(normalized, indent=2, sort_keys=True)
+    text = (
+        "# Context Tag Index\n\n"
+        "_machine-readable index of `tag -> [{file, anchor}]` for this contextID._\n\n"
+        "```json\n" + body + "\n```\n"
+    )
+    tmp = index_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, index_path)
+
+
+def _update_index_with_dump(
+    index_path: str,
+    dump_filename: str,
+    tags_by_section: dict[str, list[str]],
+) -> dict[str, list[dict]]:
+    """Load index.md, merge in the new dump's anchors, write it back atomically."""
+    index = _read_index(index_path)
+    for anchor, tags in tags_by_section.items():
+        for tag in tags:
+            index.setdefault(tag, []).append({"file": dump_filename,
+                                              "anchor": anchor})
+    _write_index(index_path, index)
+    return index
+
+
+def _write_dump_file(
+    context_id: str,
+    sections: list[dict],
+    tags_by_section: dict[str, list[str]],
+    *,
+    work_dir: str | None = None,
+    timestamp: str | None = None,
+) -> tuple[str, str]:
+    """Write `dump-HHMMSS.md` and update the contextID-scoped index.md.
+
+    Returns ``(dump_path, index_path)`` (both absolute).
+    """
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%H%M%S")
+    ctx_dir = _context_dir_for_id(context_id, work_dir=work_dir)
+    os.makedirs(ctx_dir, exist_ok=True)
+    dump_filename = f"dump-{timestamp}.md"
+    dump_path = os.path.join(ctx_dir, dump_filename)
+    text = _render_dump_markdown(
+        context_id=context_id,
+        sections=sections,
+        tags_by_section=tags_by_section,
+        timestamp=timestamp,
+    )
+    tmp = dump_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, dump_path)
+    index_path = os.path.join(ctx_dir, "index.md")
+    _update_index_with_dump(index_path, dump_filename, tags_by_section)
+    return dump_path, index_path
+
+
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
