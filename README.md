@@ -96,7 +96,13 @@ Enter a mode with `/ce:<mode>` and exit with `/ce:done`. Each mode has a structu
 ### Context Management
 
 - **Multi-model workflow support**: The manager and each major CE phase can use different models. Concurrency and memory limits are switched automatically, and the manager model is explicitly unloaded before specialist phase models are loaded during `/ce:flow`.
-- **Emergency trim**: When the context window fills up, the agent drops the oldest non-system messages and retries automatically.
+- **Proactive context dumps** (new): When a layer's prompt-token usage crosses 60% of the model's context limit, the agent runs a checkpoint cycle before the next API call: it asks the model for a structured snapshot, splits the conversation into role-coherent sections, requests per-section tags, writes a dated dump file (`.currentContext/<date>/<contextID>/dump-HHMMSS.md`) plus an `index.md` mapping `tag -> [{file, anchor}]`, and rebuilds the working message list as `[system, first_user_prompt, snapshot_system_message, safe_tail]`. The next API call sees a much smaller context. Failures fall back to `emergency_trim` and write a forensic record to `~/.omlx/last_dump_failure.json`.
+- **`recall_context` tool**: Worker layers can retrieve archived sections by tag (`recall_context(tags=["..."], context_id="current", limit=5)`). Output is capped at ~4096 tokens; the last hit is truncated with a marker rather than dropped.
+- **`contextID` minting**: A fresh `HHMMSS-XXXX` contextID is minted on every TUI / plain input-box chat submission (and only on those — pure display slash commands like `/help`, `/status`, `/clear`, `/context` do not mint). Manager-generated user messages do not mint either, so a single `/ce:flow` run shares one contextID across all phases.
+- **Tag normalization**: Each new chat turn runs a synchronous pass over `.currentContext/contextTags.md` that merges newly-proposed near-duplicates into the canonical taxonomy (`auth` <- `authentication`) and rewrites every `index.md` that referenced the duplicate. Failures are swallowed so the user prompt is never blocked.
+- **`/context` command**: Print the active contextID, per-layer dump counts, the active layer's last prompt-token percentage, the archive directory, and the most recent dump failure (if any).
+- **Per-model context limits**: Override defaults at launch via `--context-limit MODEL=N` (repeatable). Persisted to `~/.omlx/model_context_limits.json`.
+- **Emergency trim**: When the API still returns "Prompt too long" after a checkpoint cycle (or when a cycle itself fails), the agent drops the oldest non-system messages and retries automatically.
 - **Auto-continue**: If generation hits the token limit mid-response, the agent prompts the model to continue where it left off.
 - **Learnings preloaded**: The first 3000 chars of `compound-engineering.local.md` are injected as a system message at startup.
 

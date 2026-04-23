@@ -339,6 +339,78 @@ def _begin_user_chat_turn(work_dir: str | None = None) -> str:
     return cid
 
 
+def _format_context_state(active_layer: str | None = None,
+                          active_model: str | None = None,
+                          messages: list | None = None,
+                          work_dir: str | None = None) -> str:
+    """Human-readable summary of proactive context-management state.
+
+    Shows the active contextID, per-layer dump counts and last prompt-token
+    usage as a percent of the model limit, the most recent dump-failure
+    record (if any), and the path to the contextID's archive directory.
+    """
+    lines: list[str] = ["Context Management:"]
+    cid = _active_context_id or "(none -- no chat turn yet)"
+    lines.append(f"  Active contextID: {cid}")
+    if active_layer and active_model:
+        limit = get_model_context_limit(active_model)
+        layer_state = _get_layer_state(active_layer)
+        last = layer_state.get("last_prompt_tokens", 0)
+        pct = (last / limit) * 100 if limit else 0
+        lines.append(
+            f"  Active layer: {active_layer} ({active_model}) "
+            f"-- last call: {last}/{limit} = {pct:.0f}%"
+        )
+    lines.append(
+        f"  Dump trigger: >= {int(CONTEXT_DUMP_THRESHOLD * 100)}% "
+        f"(hard ceiling {int(CONTEXT_DUMP_HARD_CEILING * 100)}%)"
+    )
+    if _layer_context_state:
+        lines.append("  Per-layer state:")
+        for layer in sorted(_layer_context_state):
+            st = _layer_context_state[layer]
+            lines.append(
+                f"    {layer:<18s} "
+                f"dumps={st.get('dump_count', 0):<2d} "
+                f"last_tokens={st.get('last_prompt_tokens', 0)} "
+                f"first_user_idx={st.get('first_user_msg_idx')}"
+            )
+    else:
+        lines.append("  Per-layer state: (no layers active yet)")
+
+    if _active_context_id:
+        ctx_dir = _context_dir_for_id(_active_context_id, work_dir=work_dir)
+        if os.path.isdir(ctx_dir):
+            try:
+                dumps = sorted(f for f in os.listdir(ctx_dir)
+                               if f.startswith("dump-") and f.endswith(".md"))
+            except OSError:
+                dumps = []
+            lines.append(f"  Archive dir: {ctx_dir}")
+            lines.append(f"  Dumps in this contextID: {len(dumps)}")
+            if dumps:
+                lines.append(f"    most recent: {dumps[-1]}")
+        else:
+            lines.append(f"  Archive dir: {ctx_dir} (not yet created)")
+
+    master = _load_master_tags(work_dir)
+    lines.append(f"  Master taxonomy tags: {len(master)}")
+
+    if os.path.isfile(LAST_DUMP_FAILURE_PATH):
+        try:
+            with open(LAST_DUMP_FAILURE_PATH, "r") as f:
+                rec = json.load(f)
+            lines.append(
+                f"  Last dump failure: {rec.get('error_type', '?')} "
+                f"on layer={rec.get('layer', '?')} "
+                f"at {rec.get('timestamp', '?')}"
+            )
+            lines.append(f"    log: {LAST_DUMP_FAILURE_PATH}")
+        except (OSError, json.JSONDecodeError):
+            lines.append(f"  Last dump failure log: {LAST_DUMP_FAILURE_PATH} (unreadable)")
+    return "\n".join(lines)
+
+
 def _last_message_is_clean_boundary(messages: list) -> bool:
     """True iff the last message is a complete assistant turn with no
     orphaned tool_calls awaiting matching tool responses.
@@ -5950,6 +6022,17 @@ class AgentTUI:
             lines.append(tool_git_status())
             self.add_output("\n".join(lines), C_DEFAULT)
             return
+        elif text == "/context":
+            self.add_output(
+                _format_context_state(
+                    active_layer=self.active_group,
+                    active_model=self.active_model,
+                    messages=self.messages,
+                    work_dir=WORK_DIR,
+                ),
+                C_DEFAULT,
+            )
+            return
         elif text == "/ce:flow":
             _begin_user_chat_turn(WORK_DIR)
             self._start_managed_flow("Drive the full Compound Engineering workflow for the current task.")
@@ -6729,6 +6812,7 @@ HELP_TEXT = """Commands:
     /model              Switch model for a CE step group (letter + model#)
   /clear              Clear conversation
   /status             Show git status and session info
+  /context            Show proactive context-management state (contextID, dump counts, last failure)
   /quit               Exit (also Ctrl+D)
 
 Compound Engineering:
@@ -7081,6 +7165,15 @@ def _main_plain(model_config, messages, models):
                 done = sum(1 for t in SESSION_TODOS if t["done"])
                 print(f"Todos: {done}/{len(SESSION_TODOS)} complete")
             print(tool_git_status())
+            continue
+        elif user_input == "/context":
+            group = CE_MODE_TO_GROUP.get(active_ce_mode, "work")
+            print(_format_context_state(
+                active_layer=group,
+                active_model=_get_model(),
+                messages=messages,
+                work_dir=WORK_DIR,
+            ))
             continue
         elif user_input == "/ce:flow" or user_input.startswith("/ce:flow "):
             _begin_user_chat_turn(WORK_DIR)
