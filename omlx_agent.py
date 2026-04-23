@@ -211,6 +211,371 @@ def _parse_context_limit_arg(raw: str) -> tuple[str, int]:
 # Load any persisted per-model overrides at import time so all layers see them.
 _load_model_context_overrides()
 
+
+# ── Snapshot generation and message-list rebuild (U2) ────────────────────────
+# Builds a CONTEXT_SNAPSHOT v1 document from the live message list, then
+# rebuilds the layer's message list around that snapshot. U6 wires this into
+# the live agent loop with the dump-to-disk side effects from U3.
+
+SNAPSHOT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "Active Task",
+    "Current Step",
+    "Decisions Made",
+    "Ruled Out / Don't Retry",
+    "Verified Facts",
+    "Unverified Assumptions",
+    "Open Questions",
+    "Files Touched",
+    "Next Intended Action",
+)
+
+SNAPSHOT_TEMPLATE = """CONTEXT_SNAPSHOT v1
+
+You are about to lose the bulk of your working context to make room for new
+work. Fill in EVERY section below using ONLY information already present in
+this conversation. Do not invent facts.
+
+Rules:
+- Use the EXACT section headings shown, prefixed with `## `.
+- Every section is mandatory. If a section is genuinely empty, write the
+  literal text `(none)` on its own line.
+- The `## Ruled Out / Don't Retry` section is the most important: record any
+  approach, tool call, file edit, or hypothesis that was tried and rejected,
+  so a future agent does not repeat it.
+- Be concise but specific. Prefer file paths, function names, and exact error
+  strings over paraphrase.
+- Do NOT call any tools. Output only the filled-in template.
+
+Template:
+
+## Active Task
+<one or two sentences describing the goal currently being pursued>
+
+## Current Step
+<the immediate next thing being worked on>
+
+## Decisions Made
+<bulleted list of decisions reached so far>
+
+## Ruled Out / Don't Retry
+<bulleted list of approaches that were tried and rejected, with the reason>
+
+## Verified Facts
+<bulleted list of facts verified by tool calls or file reads in this conversation>
+
+## Unverified Assumptions
+<bulleted list of assumptions made but not yet verified>
+
+## Open Questions
+<bulleted list of questions still outstanding>
+
+## Files Touched
+<bulleted list of file paths edited or created in this conversation>
+
+## Next Intended Action
+<the very next action you plan to take after this snapshot>
+"""
+
+
+class SnapshotInvalid(Exception):
+    """Raised when a snapshot response is missing required fields."""
+
+    def __init__(self, missing: list[str], raw_text: str = ""):
+        self.missing = list(missing)
+        self.raw_text = raw_text
+        super().__init__(
+            f"snapshot missing required fields: {', '.join(self.missing)}"
+        )
+
+
+def _parse_snapshot_sections(text: str) -> dict[str, str]:
+    """Split a snapshot body into a {heading: body_text} dict.
+
+    Headings are recognised as lines that start with `## ` (markdown H2).
+    Body text is everything between one heading and the next, stripped.
+    """
+    sections: dict[str, str] = {}
+    current: str | None = None
+    buf: list[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("## "):
+            if current is not None:
+                sections[current] = "\n".join(buf).strip()
+            current = stripped[3:].strip()
+            buf = []
+        else:
+            if current is not None:
+                buf.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buf).strip()
+    return sections
+
+
+def _validate_snapshot(text: str) -> dict[str, str]:
+    """Parse and validate a snapshot body. Raises SnapshotInvalid on failure.
+
+    A section is considered missing if its heading is absent OR its body is
+    empty. Note: the literal token `(none)` counts as a non-empty body and is
+    the supported way to mark a section as having nothing to record.
+    """
+    sections = _parse_snapshot_sections(text)
+    missing: list[str] = []
+    for field in SNAPSHOT_REQUIRED_FIELDS:
+        body = sections.get(field, "").strip()
+        if not body:
+            missing.append(field)
+    if missing:
+        raise SnapshotInvalid(missing, raw_text=text or "")
+    return {field: sections[field].strip() for field in SNAPSHOT_REQUIRED_FIELDS}
+
+
+def _format_snapshot_for_injection(snapshot: dict[str, str]) -> str:
+    """Format a validated snapshot as the body of a system message."""
+    lines = ["CONTEXT_SNAPSHOT v1 (auto-generated checkpoint)", ""]
+    for field in SNAPSHOT_REQUIRED_FIELDS:
+        lines.append(f"## {field}")
+        lines.append(snapshot[field])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _request_snapshot(messages: list, model: str, api_call_fn=None) -> dict[str, str]:
+    """Ask ``model`` to fill in the snapshot template against ``messages``.
+
+    Returns the validated section dict. Raises SnapshotInvalid if the model's
+    response is missing required fields, or RuntimeError if the API call
+    itself failed.
+
+    ``api_call_fn`` is injected for tests; production callers omit it and the
+    module-level ``api_call`` is used.
+    """
+    if api_call_fn is None:
+        api_call_fn = api_call
+    snapshot_messages = list(messages) + [
+        {
+            "role": "user",
+            "content": SNAPSHOT_TEMPLATE,
+        }
+    ]
+    # Pass tools=[] so the model cannot call tools mid-snapshot.
+    response = api_call_fn(snapshot_messages, model, tools=[])
+    if not response or response.get("_context_overflow"):
+        raise RuntimeError("snapshot api_call returned no usable response")
+    parsed = normalize_api_response(response)
+    text = parsed.get("text", "") or ""
+    return _validate_snapshot(text)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap token estimate: ~4 chars per token. Matches the plan's heuristic."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _message_token_estimate(msg: dict) -> int:
+    """Rough token cost of a single message including role/structural overhead."""
+    if not isinstance(msg, dict):
+        return 8
+    body = ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        body = content
+    elif isinstance(content, list):
+        # OpenAI multipart content arrays.
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("text") or item.get("content") or ""
+                if isinstance(t, str):
+                    parts.append(t)
+        body = "\n".join(parts)
+    # Tool calls and tool responses carry their own payloads.
+    tool_calls = msg.get("tool_calls") or []
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                body += "\n" + str(fn.get("name", "")) + "\n" + str(fn.get("arguments", ""))
+    if msg.get("tool_call_id"):
+        body += "\n" + str(msg["tool_call_id"])
+    # 8 token overhead for role + structural tokens.
+    return 8 + _estimate_tokens(body)
+
+
+def _is_assistant_with_tool_calls(msg: dict) -> bool:
+    return (
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and bool(msg.get("tool_calls"))
+    )
+
+
+def _safe_tail_slice(messages: list, budget_tokens: int) -> list:
+    """Return the longest suffix of ``messages`` that:
+
+    1. Costs no more than ``budget_tokens`` (rough estimate).
+    2. Ends on a complete assistant turn (i.e. either an assistant message
+       with no pending tool_calls, OR a `tool` response message that
+       satisfies an earlier assistant tool_calls).
+    3. Does not begin in the middle of a tool_calls / tool-response group
+       (i.e. the slice never includes a `role: "tool"` message without the
+       assistant message that issued the matching tool_calls).
+
+    Always returns at least the last complete assistant turn (cannot shrink
+    below one), even if that exceeds the budget — this is required so the
+    rebuilt list still has a meaningful continuation point.
+    """
+    if not messages:
+        return []
+
+    # Step 1: walk backwards, accumulating tokens, stopping when the next
+    # message would exceed the budget. Track the earliest index we keep.
+    n = len(messages)
+    accumulated = 0
+    keep_from = n  # exclusive: messages[keep_from:] is the slice
+    for i in range(n - 1, -1, -1):
+        cost = _message_token_estimate(messages[i])
+        if accumulated + cost > budget_tokens and keep_from < n:
+            break
+        accumulated += cost
+        keep_from = i
+
+    # Step 2: if the slice begins on a `tool` response, walk further back to
+    # include the assistant message that issued the tool_calls. If we cannot
+    # find a matching assistant message inside the slice's reachable history,
+    # advance keep_from past the orphaned tool responses instead.
+    while keep_from < n and isinstance(messages[keep_from], dict) and messages[keep_from].get("role") == "tool":
+        # Look for the assistant that issued this tool_call.
+        target_id = messages[keep_from].get("tool_call_id")
+        owner_idx = None
+        for j in range(keep_from - 1, -1, -1):
+            m = messages[j]
+            if _is_assistant_with_tool_calls(m):
+                ids = {tc.get("id") for tc in m["tool_calls"] if isinstance(tc, dict)}
+                if target_id in ids:
+                    owner_idx = j
+                break
+        if owner_idx is None:
+            # Orphaned tool message — drop it from the slice.
+            keep_from += 1
+            continue
+        keep_from = owner_idx
+
+    # Step 3: ensure the slice ends on a complete assistant turn. If the
+    # final assistant message has tool_calls but its matching tool responses
+    # are missing, we must walk backwards past it.
+    while keep_from < n:
+        last = messages[n - 1]
+        if not _is_assistant_with_tool_calls(last):
+            break
+        # Check whether all tool_calls have matching tool responses inside
+        # messages[keep_from:n].
+        expected = {tc.get("id") for tc in last["tool_calls"] if isinstance(tc, dict)}
+        seen: set = set()
+        for k in range(n - 1, keep_from - 1, -1):
+            m = messages[k]
+            if isinstance(m, dict) and m.get("role") == "tool":
+                seen.add(m.get("tool_call_id"))
+        if expected.issubset(seen):
+            break
+        # In-flight tool_calls at the tail (this should not happen because
+        # _should_dump's clean-boundary guard filters this case out, but we
+        # defend in depth here). Drop the trailing assistant turn.
+        n -= 1
+
+    # Guarantee: never return an empty slice while there exists at least one
+    # message — fall back to the last message (and its surrounding tool group
+    # if needed) so the rebuilt list has continuation context.
+    if keep_from >= n:
+        keep_from = max(0, len(messages) - 1)
+        n = len(messages)
+        # Re-apply the orphan guard for the singleton case.
+        while keep_from < n and isinstance(messages[keep_from], dict) and messages[keep_from].get("role") == "tool":
+            keep_from += 1
+        if keep_from >= n:
+            return []
+
+    return list(messages[keep_from:n])
+
+
+def _find_first_user_message_index(messages: list) -> int | None:
+    """Return the index of the first ``role: "user"`` message, or None."""
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return i
+    return None
+
+
+def _rebuild_messages_with_snapshot(
+    messages: list,
+    snapshot: dict[str, str],
+    *,
+    first_user_idx: int | None = None,
+    tail_budget_tokens: int = 2048,
+) -> list:
+    """Construct the post-checkpoint message list.
+
+    Order: [original_system_messages] + [first_user_prompt_of_contextID]
+        + [snapshot as system message] + [_safe_tail_slice(messages, budget)]
+
+    - All leading ``role: "system"`` messages are preserved verbatim.
+    - The first user message is taken at ``first_user_idx`` if provided,
+      otherwise the first user message in ``messages`` is used (U2 fallback;
+      U6 will pass the contextID-scoped index).
+    - The snapshot is injected as a single ``role: "system"`` message whose
+      body is the formatted snapshot.
+    - The tail slice is computed against ``messages`` and is guaranteed to
+      end on a clean assistant turn.
+    - Duplicate inclusion is avoided: if the first user message also appears
+      inside the tail slice, it is not repeated.
+    """
+    if not messages:
+        return []
+
+    # Leading system messages.
+    leading_system: list = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            leading_system.append(m)
+        else:
+            break
+
+    # First user prompt (contextID-scoped if known, else first overall).
+    if first_user_idx is None:
+        first_user_idx = _find_first_user_message_index(messages)
+    first_user_msg = None
+    if first_user_idx is not None and 0 <= first_user_idx < len(messages):
+        candidate = messages[first_user_idx]
+        if isinstance(candidate, dict) and candidate.get("role") == "user":
+            first_user_msg = candidate
+
+    # Snapshot system message.
+    snapshot_msg = {
+        "role": "system",
+        "content": _format_snapshot_for_injection(snapshot),
+    }
+
+    # Tail slice.
+    tail = _safe_tail_slice(messages, tail_budget_tokens)
+
+    # Drop anything from the tail that we already included as the prefix
+    # (leading system messages and the first user message). Compare by
+    # identity since these are the same dict objects from ``messages``.
+    prefix_ids = {id(m) for m in leading_system}
+    if first_user_msg is not None:
+        prefix_ids.add(id(first_user_msg))
+    tail = [m for m in tail if id(m) not in prefix_ids]
+
+    rebuilt: list = []
+    rebuilt.extend(leading_system)
+    if first_user_msg is not None:
+        rebuilt.append(first_user_msg)
+    rebuilt.append(snapshot_msg)
+    rebuilt.extend(tail)
+    return rebuilt
+
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
@@ -2194,11 +2559,17 @@ def _restart_omlx_server(max_wait: float = 90.0) -> bool:
         _omlx_restart_in_progress = False
 
 
-def api_call(messages: list, model: str) -> dict:
+def api_call(messages: list, model: str, tools: list | None = None) -> dict:
+    """Call the chat completions endpoint.
+
+    If ``tools`` is None (the default), the global ``TOOLS`` list is sent so
+    the model can call tools as usual. Pass ``tools=[]`` for one-shot calls
+    that must NOT trigger tool use (e.g. the context-snapshot request).
+    """
     payload = {
         "model": model,
         "messages": messages,
-        "tools": TOOLS,
+        "tools": TOOLS if tools is None else tools,
         "max_tokens": MAX_TOKENS,
     }
     data = json.dumps(payload).encode("utf-8")
