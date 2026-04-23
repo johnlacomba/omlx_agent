@@ -1335,6 +1335,118 @@ def _write_dump_file(
     return dump_path, index_path
 
 
+# ── checkpoint cycle (U6) ────────────────────────────────────────────────────
+# Composes U2 (snapshot + rebuild), U3 (sections + tags + dump file), and U5
+# (active contextID) into a single function the agent loop can call when the
+# trigger fires. Any failure inside the cycle falls back to emergency_trim and
+# leaves a ~/.omlx/last_dump_failure.json forensic record.
+
+LAST_DUMP_FAILURE_PATH = os.path.expanduser("~/.omlx/last_dump_failure.json")
+
+
+def _record_dump_failure(record: dict) -> None:
+    """Best-effort write of ~/.omlx/last_dump_failure.json. Never raises."""
+    try:
+        os.makedirs(os.path.dirname(LAST_DUMP_FAILURE_PATH), exist_ok=True)
+        tmp = LAST_DUMP_FAILURE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, sort_keys=True, default=str)
+        os.replace(tmp, LAST_DUMP_FAILURE_PATH)
+    except Exception:
+        pass
+
+
+def run_checkpoint_cycle(
+    layer: str,
+    messages: list,
+    model: str,
+    *,
+    work_dir: str | None = None,
+    api_call_fn=None,
+    original_token_count: int = 0,
+) -> tuple[list, dict | None]:
+    """Run the proactive context-management cycle for ``layer``.
+
+    On success: snapshots the current message list, splits it into sections,
+    asks the model to tag each section, writes a ``dump-HHMMSS.md`` + updates
+    ``index.md``, and returns ``(rebuilt_messages, result)`` where the
+    rebuilt list is the new working message list for ``layer``.
+
+    On failure (snapshot invalid, network error, disk error, malformed
+    response): writes ``~/.omlx/last_dump_failure.json``, calls
+    ``emergency_trim`` on the original ``messages``, and returns
+    ``(trimmed_messages, {"fallback": True, ...})``.
+
+    Returns ``(messages, None)`` on caller-side guard misses (no contextID
+    could be minted, etc.).
+    """
+    import urllib.error
+
+    layer_state = _get_layer_state(layer)
+    context_id = _active_context_id or layer_state.get("context_id")
+    if not context_id:
+        # No mint yet (e.g. initial system message turn). Mint defensively
+        # so the dump has somewhere to live.
+        context_id = _mint_context_id()
+        layer_state["context_id"] = context_id
+
+    try:
+        snapshot = _request_snapshot(messages, model, api_call_fn=api_call_fn)
+        sections = _split_messages_into_sections(messages)
+        master_tags = _load_master_tags(work_dir)
+        tags_by_section, new_tags = _request_section_tags(
+            sections, master_tags, model, api_call_fn=api_call_fn,
+        )
+        if new_tags:
+            _append_master_tags(new_tags, work_dir=work_dir)
+        dump_path, index_path = _write_dump_file(
+            context_id, sections, tags_by_section, work_dir=work_dir,
+        )
+        first_user_idx = layer_state.get("first_user_msg_idx")
+        if first_user_idx is None:
+            first_user_idx = _find_first_user_message_index(messages)
+        rebuilt = _rebuild_messages_with_snapshot(
+            messages, snapshot, first_user_idx=first_user_idx,
+        )
+        new_token_count = sum(_message_token_estimate(m) for m in rebuilt)
+        layer_state["dump_count"] = layer_state.get("dump_count", 0) + 1
+        return rebuilt, {
+            "fallback": False,
+            "context_id": context_id,
+            "layer": layer,
+            "dump_path": dump_path,
+            "index_path": index_path,
+            "old_tokens": original_token_count,
+            "new_tokens": new_token_count,
+            "section_count": len(sections),
+            "new_tags_added": [t for t, _ in new_tags],
+        }
+    except (SnapshotInvalid, urllib.error.URLError, OSError,
+            json.JSONDecodeError, RuntimeError) as exc:
+        import traceback as _tb
+        record = {
+            "context_id": context_id,
+            "layer": layer,
+            "model": model,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": _tb.format_exc(),
+            "original_token_count": original_token_count,
+            "missing_fields": getattr(exc, "missing", None),
+            "timestamp": datetime.now().isoformat(),
+        }
+        _record_dump_failure(record)
+        trimmed = emergency_trim(messages)
+        return trimmed, {
+            "fallback": True,
+            "context_id": context_id,
+            "layer": layer,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "old_tokens": original_token_count,
+        }
+
+
 # ── recall_context tool (U4) ─────────────────────────────────────────────────
 # Worker-layer tool that lets the model retrieve specific archived sections by
 # tag from earlier in the same contextID. Per plan: not exposed to the manager
@@ -6324,22 +6436,69 @@ class AgentTUI:
                     self._activity = f"tokens: {prompt_tok}p/{gen_tok}g"
                     self.needs_redraw = True
 
-                    # U1: per-layer trigger observation. Records prompt-token
-                    # usage and emits a debug line when the dump trigger would
-                    # fire. Acts as the observation harness for U7; U6 replaces
-                    # the debug line with the real checkpoint cycle.
+                    # U6: per-layer trigger -> real checkpoint cycle. Re-trigger
+                    # guard: at least one full round must elapse between cycles
+                    # so a still-too-large rebuild does not loop endlessly.
                     layer = self.active_group
                     layer_state = _get_layer_state(layer)
                     layer_state["last_prompt_tokens"] = prompt_tok
-                    if _should_dump(layer, prompt_tok, self.messages, self.active_model):
+                    cur_round = self.current_round
+                    last_dump_round = layer_state.get("last_dump_at_round", -1)
+                    can_redump = cur_round > last_dump_round + 1
+                    if (can_redump
+                            and _should_dump(layer, prompt_tok, self.messages, self.active_model)):
                         limit = get_model_context_limit(self.active_model)
-                        pct = (prompt_tok / limit) * 100 if limit else 0
+                        old_pct = (prompt_tok / limit) * 100 if limit else 0
+                        self._activity = "dumping context..."
+                        self.needs_redraw = True
                         _ts = datetime.now().strftime("%H:%M:%S")
                         tui_print(
-                            f"[{_ts}] [trigger ready: dump would fire on {layer} "
-                            f"({prompt_tok}/{limit} = {pct:.0f}%)]",
+                            f"[{_ts}] [context dump triggered on {layer} "
+                            f"({prompt_tok}/{limit} = {old_pct:.0f}%)]",
                             C_DIM,
                         )
+                        rebuilt, cycle_result = run_checkpoint_cycle(
+                            layer, self.messages, self.active_model,
+                            work_dir=WORK_DIR,
+                            original_token_count=prompt_tok,
+                        )
+                        self.messages = rebuilt
+                        layer_state["last_dump_at_round"] = cur_round
+                        layer_state["first_user_msg_idx"] = (
+                            _find_first_user_message_index(self.messages)
+                        )
+                        cid_short = (cycle_result or {}).get("context_id", "?")
+                        if cycle_result and cycle_result.get("fallback"):
+                            self._activity = (
+                                f"context dump failed -> emergency_trim "
+                                f"({cycle_result.get('error_type', '')})"
+                            )
+                            tui_print(
+                                f"[{_ts}] [context dump FAILED on {layer}: "
+                                f"{cycle_result.get('error_type', '')}: "
+                                f"{cycle_result.get('error', '')[:120]} -- "
+                                f"emergency_trim applied; see "
+                                f"~/.omlx/last_dump_failure.json]",
+                                C_RED,
+                            )
+                        elif cycle_result:
+                            new_tok = cycle_result.get("new_tokens", 0)
+                            new_pct = (new_tok / limit) * 100 if limit else 0
+                            self._activity = (
+                                f"context dump: {old_pct:.0f}% -> "
+                                f"{new_pct:.0f}%, {cid_short}"
+                            )
+                            tui_print(
+                                f"[{_ts}] [context dump {layer}: "
+                                f"{prompt_tok}p -> {new_tok}p "
+                                f"({old_pct:.0f}% -> {new_pct:.0f}%), "
+                                f"contextID={cid_short}]",
+                                C_GREEN,
+                            )
+                        self.needs_redraw = True
+                        # The rebuilt message list MUST drive the next api_call
+                        # in this round-loop iteration, so just continue.
+                        continue
 
                 if parsed["reasoning_content"]:
                     self._activity = "thinking..."
