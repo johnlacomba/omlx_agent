@@ -34,6 +34,183 @@ INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json")
 MAX_INPUT_HISTORY = 200
 
+# ── Proactive Context Management (U1) ────────────────────────────────────────
+# Per-layer prompt-token monitoring with a checkpoint trigger that fires before
+# the model's context window is exhausted. See
+# docs/plans/2026-04-23-002-feat-proactive-context-management-plan.md.
+
+DEFAULT_CONTEXT_LIMIT = 16384  # Conservative fallback for unknown models
+CONTEXT_DUMP_THRESHOLD = 0.60  # Fire dump when prompt_tokens >= 60% of limit
+CONTEXT_DUMP_HARD_CEILING = 0.90  # Refuse pre-flight if dump would push past 90%
+CONTEXT_SNAPSHOT_RESERVE = 4096  # Tokens reserved for the snapshot model output
+MODEL_CONTEXT_LIMITS_FILE = os.path.expanduser("~/.omlx/model_context_limits.json")
+
+# Built-in defaults. Users may override via --context-limit MODEL=N (persisted
+# to MODEL_CONTEXT_LIMITS_FILE). Keep this dict empty by default; populate as
+# real models are verified during U7 end-to-end testing.
+MODEL_CONTEXT_LIMITS: dict[str, int] = {}
+
+
+def _load_model_context_overrides() -> None:
+    """Merge persisted per-model context limits into MODEL_CONTEXT_LIMITS."""
+    if not os.path.isfile(MODEL_CONTEXT_LIMITS_FILE):
+        return
+    try:
+        with open(MODEL_CONTEXT_LIMITS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    for name, limit in data.items():
+        try:
+            MODEL_CONTEXT_LIMITS[str(name)] = int(limit)
+        except (TypeError, ValueError):
+            continue
+
+
+def _save_model_context_override(model: str, limit: int) -> None:
+    """Persist a single per-model context-limit override."""
+    os.makedirs(os.path.dirname(MODEL_CONTEXT_LIMITS_FILE), exist_ok=True)
+    existing: dict = {}
+    if os.path.isfile(MODEL_CONTEXT_LIMITS_FILE):
+        try:
+            with open(MODEL_CONTEXT_LIMITS_FILE, "r") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    existing[model] = int(limit)
+    tmp = MODEL_CONTEXT_LIMITS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(existing, f, indent=2, sort_keys=True)
+    os.replace(tmp, MODEL_CONTEXT_LIMITS_FILE)
+    MODEL_CONTEXT_LIMITS[model] = int(limit)
+
+
+def get_model_context_limit(model: str) -> int:
+    """Return the max-context-token limit for a model, falling back to default."""
+    if not model:
+        return DEFAULT_CONTEXT_LIMIT
+    return MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+
+
+# Per-layer state. Layer keys mirror MODEL_GROUPS keys (manager, ideate_brainstorm,
+# plan, work, review, compound). Populated lazily as each layer is first used.
+_layer_context_state: dict[str, dict] = {}
+_active_context_id: str | None = None
+
+
+def _get_layer_state(layer: str) -> dict:
+    """Return the per-layer state dict, creating it on first access."""
+    state = _layer_context_state.get(layer)
+    if state is None:
+        state = {
+            "context_id": None,
+            "first_user_msg_idx": None,
+            "dump_count": 0,
+            "last_prompt_tokens": 0,
+            "last_dump_at_round": -1,
+        }
+        _layer_context_state[layer] = state
+    return state
+
+
+def _last_message_is_clean_boundary(messages: list) -> bool:
+    """True iff the last message is a complete assistant turn with no
+    orphaned tool_calls awaiting matching tool responses.
+
+    A clean boundary is required before a checkpoint cycle so that the
+    rebuilt message list preserves OpenAI/oMLX tool-call/tool-response pairing.
+    """
+    if not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return False
+    role = last.get("role")
+    # An assistant message with tool_calls means the matching tool responses
+    # have not yet been appended. Not a clean boundary.
+    if role == "assistant":
+        return not last.get("tool_calls")
+    # If the last message is a tool response, walk backward and confirm every
+    # tool_calls id from the most recent assistant turn has a matching response.
+    if role == "tool":
+        # Find the most recent assistant message with tool_calls.
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = {tc.get("id") for tc in msg["tool_calls"] if isinstance(tc, dict)}
+                seen_ids = set()
+                for j in range(i + 1, len(messages)):
+                    m2 = messages[j]
+                    if isinstance(m2, dict) and m2.get("role") == "tool":
+                        seen_ids.add(m2.get("tool_call_id"))
+                return expected_ids.issubset(seen_ids)
+            if msg.get("role") == "assistant":
+                # Reached an earlier assistant turn without tool_calls -- safe.
+                return True
+        return True
+    # user/system as the last message means no in-flight assistant turn.
+    return role in ("user", "system")
+
+
+def _estimate_dump_overhead_tokens(messages: list) -> int:
+    """Conservative estimate of how many prompt tokens the snapshot request
+    itself will consume (the model still has to read the existing messages
+    to fill the snapshot template). Plus the reserve for its output."""
+    # Estimate input cost as ~64 tokens per message (header + structural overhead;
+    # the message bodies are already in context). Add reserve for output.
+    return max(1, len(messages)) * 64 + CONTEXT_SNAPSHOT_RESERVE
+
+
+def _should_dump(layer: str, prompt_tokens: int, messages: list, model: str) -> bool:
+    """Decide whether a checkpoint cycle should fire for this layer right now.
+
+    All three conditions must hold:
+      - prompt_tokens / model_limit >= CONTEXT_DUMP_THRESHOLD
+      - the message list ends on a clean turn boundary
+      - a pre-flight estimate keeps total usage under CONTEXT_DUMP_HARD_CEILING
+    """
+    if not prompt_tokens or prompt_tokens <= 0:
+        return False
+    limit = get_model_context_limit(model)
+    if limit <= 0:
+        return False
+    pct = prompt_tokens / limit
+    if pct < CONTEXT_DUMP_THRESHOLD:
+        return False
+    if not _last_message_is_clean_boundary(messages):
+        return False
+    overhead = _estimate_dump_overhead_tokens(messages)
+    if (prompt_tokens + overhead) / limit > CONTEXT_DUMP_HARD_CEILING:
+        return False
+    return True
+
+
+def _parse_context_limit_arg(raw: str) -> tuple[str, int]:
+    """Parse a `--context-limit MODEL=N` value. Raises ValueError on bad input."""
+    if "=" not in raw:
+        raise ValueError(f"expected MODEL=N, got {raw!r}")
+    model, _, limit_str = raw.partition("=")
+    model = model.strip()
+    if not model:
+        raise ValueError("model name cannot be empty")
+    try:
+        limit = int(limit_str.strip())
+    except ValueError as exc:
+        raise ValueError(f"limit must be an integer, got {limit_str!r}") from exc
+    if limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+    return model, limit
+
+
+# Load any persisted per-model overrides at import time so all layers see them.
+_load_model_context_overrides()
+
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
@@ -4739,6 +4916,23 @@ class AgentTUI:
                     self._activity = f"tokens: {prompt_tok}p/{gen_tok}g"
                     self.needs_redraw = True
 
+                    # U1: per-layer trigger observation. Records prompt-token
+                    # usage and emits a debug line when the dump trigger would
+                    # fire. Acts as the observation harness for U7; U6 replaces
+                    # the debug line with the real checkpoint cycle.
+                    layer = self.active_group
+                    layer_state = _get_layer_state(layer)
+                    layer_state["last_prompt_tokens"] = prompt_tok
+                    if _should_dump(layer, prompt_tok, self.messages, self.active_model):
+                        limit = get_model_context_limit(self.active_model)
+                        pct = (prompt_tok / limit) * 100 if limit else 0
+                        _ts = datetime.now().strftime("%H:%M:%S")
+                        tui_print(
+                            f"[{_ts}] [trigger ready: dump would fire on {layer} "
+                            f"({prompt_tok}/{limit} = {pct:.0f}%)]",
+                            C_DIM,
+                        )
+
                 if parsed["reasoning_content"]:
                     self._activity = "thinking..."
                     self.needs_redraw = True
@@ -5089,7 +5283,28 @@ def main():
     parser.add_argument("--repo", default=os.getcwd(), help="Path to git repo (default: cwd)")
     parser.add_argument("--model", help="Model name (skip selection, use for all groups)")
     parser.add_argument("--no-tui", action="store_true", help="Use plain text mode (no curses TUI)")
+    parser.add_argument(
+        "--context-limit",
+        action="append",
+        default=[],
+        metavar="MODEL=N",
+        help=(
+            "Override the assumed max context window for a model "
+            "(e.g. --context-limit gpt-foo=32000). Repeatable. "
+            "Persisted to ~/.omlx/model_context_limits.json."
+        ),
+    )
     args = parser.parse_args()
+
+    # Apply any --context-limit overrides before further setup so per-layer
+    # trigger logic sees the new values immediately.
+    for raw in args.context_limit:
+        try:
+            model_name, limit_val = _parse_context_limit_arg(raw)
+        except ValueError as exc:
+            print(f"--context-limit: {exc}", file=sys.stderr)
+            sys.exit(2)
+        _save_model_context_override(model_name, limit_val)
 
     set_work_dir(args.repo)
     _rotate_temp_files()
