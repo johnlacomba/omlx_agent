@@ -117,6 +117,228 @@ def _get_layer_state(layer: str) -> dict:
     return state
 
 
+def _mint_context_id() -> str:
+    """Mint a fresh contextID and reset per-layer first-message state.
+
+    Format ``HHMMSS-XXXX`` (4 hex chars from os.urandom). Sets module-level
+    ``_active_context_id`` and clears each known layer's first-message index
+    so the next message appended per layer becomes the new first user
+    message of this contextID. Layer states that do not yet exist are
+    created lazily by ``_get_layer_state`` on first use; U6 will pick up
+    ``_active_context_id`` at that point.
+    """
+    global _active_context_id
+    cid = f"{datetime.now().strftime('%H%M%S')}-{os.urandom(2).hex()}"
+    _active_context_id = cid
+    for state in _layer_context_state.values():
+        state["context_id"] = cid
+        state["first_user_msg_idx"] = None
+        state["dump_count"] = 0
+        state["last_dump_at_round"] = -1
+    return cid
+
+
+# Cutoff for difflib similarity when considering whether a newly-added tag
+# should merge into an existing canonical tag. Substring containment is
+# checked first (so "auth" merges into "authentication" despite ratio ~0.44).
+NORMALIZE_CLOSE_MATCH_RATIO = 0.6
+
+
+def _tag_merge_target(pending: str, canonical: list[str]) -> str | None:
+    """Return the canonical tag ``pending`` should merge into, or None.
+
+    Substring containment wins first (covers the "auth" / "authentication"
+    case the plan calls out). Falls back to ``difflib.get_close_matches``
+    with a moderate cutoff for typo-style near-duplicates.
+    """
+    if not pending or not canonical:
+        return None
+    p = pending.lower()
+    substring_hits = [c for c in canonical
+                      if p != c.lower() and (p in c.lower() or c.lower() in p)]
+    if substring_hits:
+        substring_hits.sort(key=len)
+        return substring_hits[0]
+    import difflib
+    matches = difflib.get_close_matches(
+        pending, canonical, n=1, cutoff=NORMALIZE_CLOSE_MATCH_RATIO,
+    )
+    return matches[0] if matches else None
+
+
+def _walk_index_paths(work_dir: str | None = None) -> list[str]:
+    """Return all ``<root>/<date>/<cid>/index.md`` paths under .currentContext/."""
+    root = _context_root(work_dir)
+    if not os.path.isdir(root):
+        return []
+    out: list[str] = []
+    try:
+        date_entries = os.listdir(root)
+    except OSError:
+        return []
+    for date_entry in date_entries:
+        date_dir = os.path.join(root, date_entry)
+        if not os.path.isdir(date_dir):
+            continue
+        try:
+            cid_entries = os.listdir(date_dir)
+        except OSError:
+            continue
+        for cid_entry in cid_entries:
+            cid_dir = os.path.join(date_dir, cid_entry)
+            idx = os.path.join(cid_dir, "index.md")
+            if os.path.isfile(idx):
+                out.append(idx)
+    return out
+
+
+def _rewrite_index_for_merges(index_path: str, merges: dict[str, str]) -> bool:
+    """Apply tag merges to a single index.md. Returns True if rewritten."""
+    if not merges:
+        return False
+    index = _read_index(index_path)
+    if not index:
+        return False
+    changed = False
+    for old, new in merges.items():
+        if old not in index:
+            continue
+        bucket = list(index.get(new, []))
+        bucket.extend(index[old])
+        index[new] = bucket
+        del index[old]
+        changed = True
+    if changed:
+        _write_index(index_path, index)
+    return changed
+
+
+def _normalize_tags_pass(work_dir: str | None = None) -> dict:
+    """Run the synchronous tag normalization pass.
+
+    Reads ``contextTags.md``, finds ``## added:`` entries appearing after the
+    last ``## normalized:`` marker, and either merges each into an existing
+    canonical tag (rewriting every ``index.md`` that references the
+    duplicate) or promotes it to canonical when no close match exists.
+    Appends a ``## normalized: <ISO>`` marker plus per-merge breadcrumb
+    lines on success.
+
+    Returns a dict with keys ``merges`` (pending -> canonical), ``promoted``
+    (list[str]), ``marker`` (ISO timestamp or ""), and optional ``error`` /
+    ``rewrite_errors``. Failures are returned in the dict; this function
+    never raises -- the caller (user prompt path) must not be blocked by a
+    corrupt taxonomy file.
+    """
+    result: dict = {"merges": {}, "promoted": [], "marker": ""}
+    path = _master_tags_path(work_dir)
+    if not os.path.isfile(path):
+        return result
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as exc:
+        result["error"] = f"read taxonomy: {exc}"
+        return result
+
+    try:
+        lines = text.splitlines()
+        last_norm_idx = -1
+        for i, raw in enumerate(lines):
+            if raw.strip().startswith("## normalized:"):
+                last_norm_idx = i
+
+        canonical: list[str] = []
+        pending: list[str] = []
+        for i, raw in enumerate(lines):
+            line = raw.strip()
+            if not line:
+                continue
+            # Skip pure-comment / heading lines (but `## added:` is data).
+            if line.startswith("#") and not line.startswith("## added:"):
+                continue
+            if line.startswith("## added:"):
+                rest = line[len("## added:"):].strip()
+                tag = rest.split("--", 1)[0].strip() if "--" in rest else rest
+            elif " # " in line:
+                tag = line.split(" # ", 1)[0].strip()
+            else:
+                tag = line
+            if not tag or not _is_valid_tag(tag):
+                continue
+            is_added = line.startswith("## added:")
+            if not is_added or i <= last_norm_idx:
+                if tag not in canonical:
+                    canonical.append(tag)
+            else:
+                if tag not in pending:
+                    pending.append(tag)
+
+        merges: dict[str, str] = {}
+        promoted: list[str] = []
+        for tag in pending:
+            target = _tag_merge_target(tag, canonical)
+            if target and target != tag:
+                merges[tag] = target
+            else:
+                promoted.append(tag)
+                if tag not in canonical:
+                    canonical.append(tag)
+    except Exception as exc:
+        result["error"] = f"parse taxonomy: {exc}"
+        return result
+
+    rewrite_errors: list[str] = []
+    if merges:
+        for idx_path in _walk_index_paths(work_dir):
+            try:
+                _rewrite_index_for_merges(idx_path, merges)
+            except OSError as exc:
+                rewrite_errors.append(f"{idx_path}: {exc}")
+
+    iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        marker_lines: list[str] = [""]
+        for old, new in merges.items():
+            marker_lines.append(f"## merged: {old} -> {new}")
+        marker_lines.append(f"## normalized: {iso}")
+        marker_lines.append("")
+        suffix = "\n".join(marker_lines)
+        prior = text if text.endswith("\n") else text + "\n"
+        new_text = prior + suffix
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp, path)
+    except OSError as exc:
+        result["error"] = f"write marker: {exc}"
+        result["merges"] = merges
+        result["promoted"] = promoted
+        return result
+
+    result["merges"] = merges
+    result["promoted"] = promoted
+    result["marker"] = iso
+    if rewrite_errors:
+        result["rewrite_errors"] = rewrite_errors
+    return result
+
+
+def _begin_user_chat_turn(work_dir: str | None = None) -> str:
+    """Mint a fresh contextID and run the synchronous tag normalization pass.
+
+    Called on TUI / plain input-box chat submissions only -- never on
+    pure display slash commands (``/help``, ``/status``, ``/clear``, ...)
+    and never on manager-generated user messages. Normalization failures
+    are logged to stderr and swallowed so the user prompt is never blocked.
+    """
+    cid = _mint_context_id()
+    try:
+        _normalize_tags_pass(work_dir)
+    except Exception as exc:
+        sys.stderr.write(f"[context-mgmt] tag normalization failed: {exc}\n")
+    return cid
+
+
 def _last_message_is_clean_boundary(messages: list) -> bool:
     """True iff the last message is a complete assistant turn with no
     orphaned tool_calls awaiting matching tool responses.
@@ -5617,9 +5839,11 @@ class AgentTUI:
             self.add_output("\n".join(lines), C_DEFAULT)
             return
         elif text == "/ce:flow":
+            _begin_user_chat_turn(WORK_DIR)
             self._start_managed_flow("Drive the full Compound Engineering workflow for the current task.")
             return
         elif text.startswith("/ce:flow "):
+            _begin_user_chat_turn(WORK_DIR)
             self._start_managed_flow(text[len("/ce:flow "):].strip())
             return
         elif text == "/ce:learnings":
@@ -5638,6 +5862,7 @@ class AgentTUI:
             return
 
         if self.workflow_state.active and self.active_ce_mode == "flow":
+            _begin_user_chat_turn(WORK_DIR)
             self.workflow_state.awaiting_user = False
             self.workflow_state.pending_question = ""
             self.workflow_state.manager_messages.append({
@@ -5665,6 +5890,7 @@ class AgentTUI:
                 break
 
         if ce_cmd:
+            _begin_user_chat_turn(WORK_DIR)
             # Nag (once per session) if /ce:setup hasn't been completed for this repo,
             # but never block the command and never nag /ce:setup itself.
             if ce_cmd != "setup" and not self._ce_setup_warned:
@@ -5699,6 +5925,7 @@ class AgentTUI:
             return
 
         # Normal message -- attach any [image:filename] references as multimodal content
+        _begin_user_chat_turn(WORK_DIR)
         user_content = self._build_user_content(text)
         self.messages.append({"role": "user", "content": user_content})
         self._run_agent_async()
@@ -6697,6 +6924,7 @@ def _main_plain(model_config, messages, models):
             print(tool_git_status())
             continue
         elif user_input == "/ce:flow" or user_input.startswith("/ce:flow "):
+            _begin_user_chat_turn(WORK_DIR)
             objective = user_input[len("/ce:flow "):].strip() if user_input.startswith("/ce:flow ") else "Drive the full Compound Engineering workflow for the current task."
             workflow_state = CEWorkflowState(
                 active=True,
@@ -6793,6 +7021,7 @@ def _main_plain(model_config, messages, models):
             continue
 
         if workflow_state.active and active_ce_mode == "flow":
+            _begin_user_chat_turn(WORK_DIR)
             workflow_state.awaiting_user = False
             workflow_state.pending_question = ""
             workflow_state.manager_messages.append({
@@ -6887,6 +7116,7 @@ def _main_plain(model_config, messages, models):
                 break
 
         if ce_cmd:
+            _begin_user_chat_turn(WORK_DIR)
             if ce_cmd != "setup" and not _ce_setup_warned[0]:
                 try:
                     _status = ce_setup_status(WORK_DIR)
@@ -6932,6 +7162,7 @@ def _main_plain(model_config, messages, models):
                 print("Not in a CE mode.")
             continue
 
+        _begin_user_chat_turn(WORK_DIR)
         messages.append({"role": "user", "content": user_input})
         print()
         _ensure_model_plain()
