@@ -1113,6 +1113,246 @@ def _write_dump_file(
     return dump_path, index_path
 
 
+# ── recall_context tool (U4) ─────────────────────────────────────────────────
+# Worker-layer tool that lets the model retrieve specific archived sections by
+# tag from earlier in the same contextID. Per plan: not exposed to the manager
+# layer (the manager's JSON-only contract forbids tool use); registered in the
+# global TOOLS so all worker layers see it.
+
+RECALL_TOKEN_BUDGET = 4096  # max chars/4 across all returned excerpts per call
+_RECALL_DUMP_FILENAME_RE = re.compile(r"^dump-(\d{6})\.md$")
+
+
+def _list_dump_dirs_for_id(context_id: str, *, work_dir: str | None = None) -> list[str]:
+    """Return all `<root>/YYYY-MM-DD/<context_id>/` directories that exist.
+
+    Walks every dated subdirectory under ``.currentContext/`` because a long-
+    running contextID could in principle straddle a date boundary. Returned
+    list is unsorted; callers handle ordering.
+    """
+    root = _context_root(work_dir)
+    if not os.path.isdir(root):
+        return []
+    matches: list[str] = []
+    for date_entry in os.listdir(root):
+        date_dir = os.path.join(root, date_entry)
+        if not os.path.isdir(date_dir):
+            continue
+        candidate = os.path.join(date_dir, context_id)
+        if os.path.isdir(candidate):
+            matches.append(candidate)
+    return matches
+
+
+def _read_dump_section(dump_path: str, anchor: str) -> str | None:
+    """Extract the body of ``anchor`` from ``dump_path`` as plain text.
+
+    Reads the fenced ```text block immediately following the anchor's heading.
+    Returns None if the anchor is not found or the file cannot be read.
+    """
+    if not os.path.isfile(dump_path):
+        return None
+    try:
+        with open(dump_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    needle = f'<a id="{anchor}"></a>'
+    start = text.find(needle)
+    if start == -1:
+        return None
+    # Find the first ```text fence after the anchor.
+    fence_open = text.find("```text", start)
+    if fence_open == -1:
+        return None
+    body_start = text.find("\n", fence_open)
+    if body_start == -1:
+        return None
+    body_start += 1
+    fence_close = text.find("```", body_start)
+    if fence_close == -1:
+        return None
+    return text[body_start:fence_close].rstrip("\n")
+
+
+def _suggest_nearest_tags(requested: list[str], available: set[str], n: int = 3) -> list[str]:
+    """Use difflib to suggest existing tags closest to the requested ones.
+
+    Cutoff is intentionally low (0.3) because legitimate near-misses such as
+    ``auth`` vs ``authentication`` score around 0.44 due to length disparity.
+    """
+    import difflib
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    pool = sorted(available)
+    for tag in requested:
+        # Exact substring containment is also a strong hint that didn't make
+        # it through SequenceMatcher's ratio cutoff for very short queries.
+        for candidate in pool:
+            if tag and (tag in candidate or candidate in tag) and candidate not in seen:
+                suggestions.append(candidate)
+                seen.add(candidate)
+        for hit in difflib.get_close_matches(tag, pool, n=n, cutoff=0.3):
+            if hit not in seen:
+                suggestions.append(hit)
+                seen.add(hit)
+    return suggestions[: n * max(1, len(requested))]
+
+
+def tool_recall_context(
+    tags: list[str] | str,
+    context_id: str = "current",
+    limit: int = 5,
+    *,
+    work_dir: str | None = None,
+) -> str:
+    """Look up archived sections by tag from the contextID's index.
+
+    Returns a markdown-formatted string that the model can read directly.
+
+    Resolution rules:
+      - ``context_id == "current"`` resolves to the module-level
+        ``_active_context_id``. If no active id, returns an explanatory error.
+      - If every requested tag is absent from the master taxonomy, returns
+        an error string with nearest-match suggestions (never an empty list
+        masquerading as success).
+      - If the tags exist in the master taxonomy but no section in this
+        contextID matches, returns an empty-result message (not an error,
+        per origin FR9).
+      - Hits are sorted most-recent-first by ``HHMMSS`` from the dump
+        filename, then by anchor id descending within a file.
+      - Cumulative excerpt total is capped at ``RECALL_TOKEN_BUDGET``
+        (estimated as chars/4). The last hit is truncated rather than
+        silently dropped, with a `[truncated]` marker.
+    """
+    # Normalise inputs.
+    if isinstance(tags, str):
+        requested = [t.strip().lower() for t in tags.split(",") if t.strip()]
+    elif isinstance(tags, list):
+        requested = [str(t).strip().lower() for t in tags if str(t).strip()]
+    else:
+        return "[recall_context error] `tags` must be a list of strings or a comma-separated string."
+    if not requested:
+        return "[recall_context error] `tags` must contain at least one tag."
+
+    try:
+        limit_int = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit_int = 5
+
+    # Resolve contextID.
+    resolved_id = context_id
+    if not resolved_id or resolved_id == "current":
+        if not _active_context_id:
+            return ("[recall_context error] No active contextID. "
+                    "recall_context only works inside an active session.")
+        resolved_id = _active_context_id
+
+    # Resolve directories.
+    ctx_dirs = _list_dump_dirs_for_id(resolved_id, work_dir=work_dir)
+    if not ctx_dirs:
+        return f"[recall_context error] No archive found for contextID `{resolved_id}`."
+
+    # Tag taxonomy gate: if NONE of the requested tags exist in the master
+    # taxonomy, treat as a typo / wrong-vocabulary mistake and suggest.
+    master_tags = _load_master_tags(work_dir=work_dir)
+    if master_tags:
+        known = [t for t in requested if t in master_tags]
+        if not known:
+            suggestions = _suggest_nearest_tags(requested, master_tags)
+            sug_text = (", ".join(f"`{t}`" for t in suggestions)
+                        if suggestions else "(none)")
+            return (
+                f"[recall_context error] None of the requested tags exist in "
+                f"the master taxonomy: {', '.join(repr(t) for t in requested)}.\n"
+                f"Nearest existing tags: {sug_text}"
+            )
+
+    # Walk every (ctx_dir, dump_file, anchor) hit across all index.md files.
+    hits: list[dict] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for ctx_dir in ctx_dirs:
+        index_path = os.path.join(ctx_dir, "index.md")
+        index = _read_index(index_path)
+        if not index:
+            continue
+        for tag in requested:
+            for entry in index.get(tag, []):
+                file_name = entry.get("file", "")
+                anchor = entry.get("anchor", "")
+                if not file_name or not anchor:
+                    continue
+                key = (ctx_dir, file_name, anchor)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                hits.append({
+                    "ctx_dir": ctx_dir,
+                    "file": file_name,
+                    "anchor": anchor,
+                    "tag": tag,
+                })
+
+    if not hits:
+        return (f"[recall_context] No matching sections in contextID "
+                f"`{resolved_id}` for tags: {', '.join(repr(t) for t in requested)}.")
+
+    # Sort most-recent-first: HHMMSS from filename desc, then anchor desc.
+    def _sort_key(h: dict) -> tuple[int, str]:
+        m = _RECALL_DUMP_FILENAME_RE.match(h["file"])
+        ts = int(m.group(1)) if m else 0
+        return (-ts, _invert_anchor_for_sort(h["anchor"]))
+
+    hits.sort(key=_sort_key)
+    selected = hits[:limit_int]
+
+    # Read each hit's body, enforcing the cumulative budget. Last hit may be
+    # truncated rather than dropped.
+    out_lines: list[str] = [
+        f"# recall_context results: contextID `{resolved_id}`",
+        f"_tags requested: {', '.join(requested)} -- "
+        f"matched {len(hits)} section(s), returning {len(selected)}_",
+        "",
+    ]
+    budget_chars = RECALL_TOKEN_BUDGET * 4
+    used_chars = 0
+    for hit in selected:
+        dump_path = os.path.join(hit["ctx_dir"], hit["file"])
+        body = _read_dump_section(dump_path, hit["anchor"]) or ""
+        remaining = budget_chars - used_chars
+        if remaining <= 0:
+            out_lines.append(
+                f"_[recall_context: budget exhausted; "
+                f"{len(selected) - selected.index(hit)} more hit(s) omitted]_"
+            )
+            break
+        truncated = False
+        if len(body) > remaining:
+            body = body[:remaining]
+            truncated = True
+        used_chars += len(body)
+        out_lines.append(f"## {hit['file']} {hit['anchor']} (matched `{hit['tag']}`)")
+        out_lines.append("```text")
+        out_lines.append(body)
+        if truncated:
+            out_lines.append("[truncated]")
+        out_lines.append("```")
+        out_lines.append("")
+    return "\n".join(out_lines).rstrip() + "\n"
+
+
+def _invert_anchor_for_sort(anchor: str) -> str:
+    """Return a sort key that orders ``s-014`` before ``s-001`` (desc).
+
+    Anchors are zero-padded so a simple negated numeric extraction works.
+    """
+    m = re.match(r"s-(\d+)", anchor or "")
+    if not m:
+        return ""
+    # Negative number formatted as fixed width string for tuple ordering.
+    return f"-{int(m.group(1)):010d}"
+
+
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
@@ -1414,6 +1654,34 @@ TOOLS = [
                 "type": "object",
                 "properties": {},
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_context",
+            "description": "Retrieve archived conversation sections by tag from earlier in this contextID. Use when the proactive context-management system has checkpointed (you'll see a CONTEXT_SNAPSHOT system message) and you need a specific detail that was dropped from the live context. Returns markdown excerpts capped at a per-call token budget. Pass `tags` as a list of one or more existing tag strings; pass `context_id` as 'current' (default) to use the active session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "One or more tag strings to look up. Tags must come from the master taxonomy; if none match, an error with nearest-tag suggestions is returned."
+                    },
+                    "context_id": {
+                        "type": "string",
+                        "description": "ContextID to search. Defaults to 'current' (the active session). Format is HHMMSS-xxxx.",
+                        "default": "current"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of section excerpts to return (default 5). The cumulative excerpt size is also capped by RECALL_TOKEN_BUDGET.",
+                        "default": 5
+                    },
+                },
+                "required": ["tags"],
             },
         },
     },
@@ -2546,6 +2814,11 @@ TOOL_DISPATCH = {
     "ce_scan_solution_headers": lambda args: tool_ce_scan_solution_headers(args.get("directory")),
     "ce_run_agent": lambda args: tool_ce_run_agent(args["agent_name"], args["task"]),
     "ce_list_agents": lambda args: tool_ce_list_agents(),
+    "recall_context": lambda args: tool_recall_context(
+        args["tags"],
+        args.get("context_id", "current"),
+        args.get("limit", 5),
+    ),
 }
 
 
