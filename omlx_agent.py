@@ -5186,6 +5186,7 @@ def _main_plain(model_config, messages, models):
             _current_model_name = None
 
         start_idx = len(messages)
+        saved_mode = active_ce_mode
         active_ce_mode = actual_phase
         messages.append({
             "role": "system",
@@ -5195,6 +5196,7 @@ def _main_plain(model_config, messages, models):
         messages.append({"role": "user", "content": phase_input})
         _ensure_model_plain()
         result = agent_turn(messages, _get_model())
+        active_ce_mode = saved_mode or "flow"
         del messages[start_idx:start_idx + 2]
         return result
 
