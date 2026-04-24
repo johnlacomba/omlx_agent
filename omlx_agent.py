@@ -34,6 +34,1731 @@ INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json")
 MAX_INPUT_HISTORY = 200
 
+# ── Proactive Context Management (U1) ────────────────────────────────────────
+# Per-layer prompt-token monitoring with a checkpoint trigger that fires before
+# the model's context window is exhausted. See
+# docs/plans/2026-04-23-002-feat-proactive-context-management-plan.md.
+
+DEFAULT_CONTEXT_LIMIT = 16384  # Conservative fallback for unknown models
+CONTEXT_DUMP_THRESHOLD = 0.60  # Fire dump when prompt_tokens >= 60% of limit
+CONTEXT_DUMP_HARD_CEILING = 0.90  # Refuse pre-flight if dump would push past 90%
+CONTEXT_SNAPSHOT_RESERVE = 4096  # Tokens reserved for the snapshot model output
+MODEL_CONTEXT_LIMITS_FILE = os.path.expanduser("~/.omlx/model_context_limits.json")
+
+# Built-in defaults. Users may override via --context-limit MODEL=N (persisted
+# to MODEL_CONTEXT_LIMITS_FILE). Keep this dict empty by default; populate as
+# real models are verified during U7 end-to-end testing.
+MODEL_CONTEXT_LIMITS: dict[str, int] = {}
+
+
+def _load_model_context_overrides() -> None:
+    """Merge persisted per-model context limits into MODEL_CONTEXT_LIMITS."""
+    if not os.path.isfile(MODEL_CONTEXT_LIMITS_FILE):
+        return
+    try:
+        with open(MODEL_CONTEXT_LIMITS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    for name, limit in data.items():
+        try:
+            MODEL_CONTEXT_LIMITS[str(name)] = int(limit)
+        except (TypeError, ValueError):
+            continue
+
+
+def _save_model_context_override(model: str, limit: int) -> None:
+    """Persist a single per-model context-limit override."""
+    os.makedirs(os.path.dirname(MODEL_CONTEXT_LIMITS_FILE), exist_ok=True)
+    existing: dict = {}
+    if os.path.isfile(MODEL_CONTEXT_LIMITS_FILE):
+        try:
+            with open(MODEL_CONTEXT_LIMITS_FILE, "r") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    existing[model] = int(limit)
+    tmp = MODEL_CONTEXT_LIMITS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(existing, f, indent=2, sort_keys=True)
+    os.replace(tmp, MODEL_CONTEXT_LIMITS_FILE)
+    MODEL_CONTEXT_LIMITS[model] = int(limit)
+
+
+def get_model_context_limit(model: str) -> int:
+    """Return the max-context-token limit for a model, falling back to default."""
+    if not model:
+        return DEFAULT_CONTEXT_LIMIT
+    return MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+
+
+# Per-layer state. Layer keys mirror MODEL_GROUPS keys (manager, ideate_brainstorm,
+# plan, work, review, compound). Populated lazily as each layer is first used.
+_layer_context_state: dict[str, dict] = {}
+_active_context_id: str | None = None
+
+
+def _get_layer_state(layer: str) -> dict:
+    """Return the per-layer state dict, creating it on first access."""
+    state = _layer_context_state.get(layer)
+    if state is None:
+        state = {
+            "context_id": None,
+            "first_user_msg_idx": None,
+            "dump_count": 0,
+            "last_prompt_tokens": 0,
+            "last_dump_at_round": -1,
+        }
+        _layer_context_state[layer] = state
+    return state
+
+
+def _mint_context_id() -> str:
+    """Mint a fresh contextID and reset per-layer first-message state.
+
+    Format ``HHMMSS-XXXX`` (4 hex chars from os.urandom). Sets module-level
+    ``_active_context_id`` and clears each known layer's first-message index
+    so the next message appended per layer becomes the new first user
+    message of this contextID. Layer states that do not yet exist are
+    created lazily by ``_get_layer_state`` on first use; U6 will pick up
+    ``_active_context_id`` at that point.
+    """
+    global _active_context_id
+    cid = f"{datetime.now().strftime('%H%M%S')}-{os.urandom(2).hex()}"
+    _active_context_id = cid
+    for state in _layer_context_state.values():
+        state["context_id"] = cid
+        state["first_user_msg_idx"] = None
+        state["dump_count"] = 0
+        state["last_dump_at_round"] = -1
+    return cid
+
+
+# Cutoff for difflib similarity when considering whether a newly-added tag
+# should merge into an existing canonical tag. Substring containment is
+# checked first (so "auth" merges into "authentication" despite ratio ~0.44).
+NORMALIZE_CLOSE_MATCH_RATIO = 0.6
+
+
+def _tag_merge_target(pending: str, canonical: list[str]) -> str | None:
+    """Return the canonical tag ``pending`` should merge into, or None.
+
+    Substring containment wins first (covers the "auth" / "authentication"
+    case the plan calls out). Falls back to ``difflib.get_close_matches``
+    with a moderate cutoff for typo-style near-duplicates.
+    """
+    if not pending or not canonical:
+        return None
+    p = pending.lower()
+    substring_hits = [c for c in canonical
+                      if p != c.lower() and (p in c.lower() or c.lower() in p)]
+    if substring_hits:
+        substring_hits.sort(key=len)
+        return substring_hits[0]
+    import difflib
+    matches = difflib.get_close_matches(
+        pending, canonical, n=1, cutoff=NORMALIZE_CLOSE_MATCH_RATIO,
+    )
+    return matches[0] if matches else None
+
+
+def _walk_index_paths(work_dir: str | None = None) -> list[str]:
+    """Return all ``<root>/<date>/<cid>/index.md`` paths under .currentContext/."""
+    root = _context_root(work_dir)
+    if not os.path.isdir(root):
+        return []
+    out: list[str] = []
+    try:
+        date_entries = os.listdir(root)
+    except OSError:
+        return []
+    for date_entry in date_entries:
+        date_dir = os.path.join(root, date_entry)
+        if not os.path.isdir(date_dir):
+            continue
+        try:
+            cid_entries = os.listdir(date_dir)
+        except OSError:
+            continue
+        for cid_entry in cid_entries:
+            cid_dir = os.path.join(date_dir, cid_entry)
+            idx = os.path.join(cid_dir, "index.md")
+            if os.path.isfile(idx):
+                out.append(idx)
+    return out
+
+
+def _rewrite_index_for_merges(index_path: str, merges: dict[str, str]) -> bool:
+    """Apply tag merges to a single index.md. Returns True if rewritten."""
+    if not merges:
+        return False
+    index = _read_index(index_path)
+    if not index:
+        return False
+    changed = False
+    for old, new in merges.items():
+        if old not in index:
+            continue
+        bucket = list(index.get(new, []))
+        bucket.extend(index[old])
+        index[new] = bucket
+        del index[old]
+        changed = True
+    if changed:
+        _write_index(index_path, index)
+    return changed
+
+
+def _normalize_tags_pass(work_dir: str | None = None) -> dict:
+    """Run the synchronous tag normalization pass.
+
+    Reads ``contextTags.md``, finds ``## added:`` entries appearing after the
+    last ``## normalized:`` marker, and either merges each into an existing
+    canonical tag (rewriting every ``index.md`` that references the
+    duplicate) or promotes it to canonical when no close match exists.
+    Appends a ``## normalized: <ISO>`` marker plus per-merge breadcrumb
+    lines on success.
+
+    Returns a dict with keys ``merges`` (pending -> canonical), ``promoted``
+    (list[str]), ``marker`` (ISO timestamp or ""), and optional ``error`` /
+    ``rewrite_errors``. Failures are returned in the dict; this function
+    never raises -- the caller (user prompt path) must not be blocked by a
+    corrupt taxonomy file.
+    """
+    result: dict = {"merges": {}, "promoted": [], "marker": ""}
+    path = _master_tags_path(work_dir)
+    if not os.path.isfile(path):
+        return result
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as exc:
+        result["error"] = f"read taxonomy: {exc}"
+        return result
+
+    try:
+        lines = text.splitlines()
+        last_norm_idx = -1
+        for i, raw in enumerate(lines):
+            if raw.strip().startswith("## normalized:"):
+                last_norm_idx = i
+
+        canonical: list[str] = []
+        pending: list[str] = []
+        for i, raw in enumerate(lines):
+            line = raw.strip()
+            if not line:
+                continue
+            # Skip pure-comment / heading lines (but `## added:` is data).
+            if line.startswith("#") and not line.startswith("## added:"):
+                continue
+            if line.startswith("## added:"):
+                rest = line[len("## added:"):].strip()
+                tag = rest.split("--", 1)[0].strip() if "--" in rest else rest
+            elif " # " in line:
+                tag = line.split(" # ", 1)[0].strip()
+            else:
+                tag = line
+            if not tag or not _is_valid_tag(tag):
+                continue
+            is_added = line.startswith("## added:")
+            if not is_added or i <= last_norm_idx:
+                if tag not in canonical:
+                    canonical.append(tag)
+            else:
+                if tag not in pending:
+                    pending.append(tag)
+
+        merges: dict[str, str] = {}
+        promoted: list[str] = []
+        for tag in pending:
+            target = _tag_merge_target(tag, canonical)
+            if target and target != tag:
+                merges[tag] = target
+            else:
+                promoted.append(tag)
+                if tag not in canonical:
+                    canonical.append(tag)
+    except Exception as exc:
+        result["error"] = f"parse taxonomy: {exc}"
+        return result
+
+    rewrite_errors: list[str] = []
+    if merges:
+        for idx_path in _walk_index_paths(work_dir):
+            try:
+                _rewrite_index_for_merges(idx_path, merges)
+            except OSError as exc:
+                rewrite_errors.append(f"{idx_path}: {exc}")
+
+    iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        marker_lines: list[str] = [""]
+        for old, new in merges.items():
+            marker_lines.append(f"## merged: {old} -> {new}")
+        marker_lines.append(f"## normalized: {iso}")
+        marker_lines.append("")
+        suffix = "\n".join(marker_lines)
+        prior = text if text.endswith("\n") else text + "\n"
+        new_text = prior + suffix
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp, path)
+    except OSError as exc:
+        result["error"] = f"write marker: {exc}"
+        result["merges"] = merges
+        result["promoted"] = promoted
+        return result
+
+    result["merges"] = merges
+    result["promoted"] = promoted
+    result["marker"] = iso
+    if rewrite_errors:
+        result["rewrite_errors"] = rewrite_errors
+    return result
+
+
+def _begin_user_chat_turn(work_dir: str | None = None) -> str:
+    """Mint a fresh contextID and run the synchronous tag normalization pass.
+
+    Called on TUI / plain input-box chat submissions only -- never on
+    pure display slash commands (``/help``, ``/status``, ``/clear``, ...)
+    and never on manager-generated user messages. Normalization failures
+    are logged to stderr and swallowed so the user prompt is never blocked.
+    """
+    cid = _mint_context_id()
+    try:
+        _normalize_tags_pass(work_dir)
+    except Exception as exc:
+        sys.stderr.write(f"[context-mgmt] tag normalization failed: {exc}\n")
+    return cid
+
+
+def _format_context_state(active_layer: str | None = None,
+                          active_model: str | None = None,
+                          messages: list | None = None,
+                          work_dir: str | None = None) -> str:
+    """Human-readable summary of proactive context-management state.
+
+    Shows the active contextID, per-layer dump counts and last prompt-token
+    usage as a percent of the model limit, the most recent dump-failure
+    record (if any), and the path to the contextID's archive directory.
+    """
+    lines: list[str] = ["Context Management:"]
+    cid = _active_context_id or "(none -- no chat turn yet)"
+    lines.append(f"  Active contextID: {cid}")
+    if active_layer and active_model:
+        limit = get_model_context_limit(active_model)
+        layer_state = _get_layer_state(active_layer)
+        last = layer_state.get("last_prompt_tokens", 0)
+        pct = (last / limit) * 100 if limit else 0
+        lines.append(
+            f"  Active layer: {active_layer} ({active_model}) "
+            f"-- last call: {last}/{limit} = {pct:.0f}%"
+        )
+    lines.append(
+        f"  Dump trigger: >= {int(CONTEXT_DUMP_THRESHOLD * 100)}% "
+        f"(hard ceiling {int(CONTEXT_DUMP_HARD_CEILING * 100)}%)"
+    )
+    if _layer_context_state:
+        lines.append("  Per-layer state:")
+        for layer in sorted(_layer_context_state):
+            st = _layer_context_state[layer]
+            lines.append(
+                f"    {layer:<18s} "
+                f"dumps={st.get('dump_count', 0):<2d} "
+                f"last_tokens={st.get('last_prompt_tokens', 0)} "
+                f"first_user_idx={st.get('first_user_msg_idx')}"
+            )
+    else:
+        lines.append("  Per-layer state: (no layers active yet)")
+
+    if _active_context_id:
+        ctx_dir = _context_dir_for_id(_active_context_id, work_dir=work_dir)
+        if os.path.isdir(ctx_dir):
+            try:
+                dumps = sorted(f for f in os.listdir(ctx_dir)
+                               if f.startswith("dump-") and f.endswith(".md"))
+            except OSError:
+                dumps = []
+            lines.append(f"  Archive dir: {ctx_dir}")
+            lines.append(f"  Dumps in this contextID: {len(dumps)}")
+            if dumps:
+                lines.append(f"    most recent: {dumps[-1]}")
+        else:
+            lines.append(f"  Archive dir: {ctx_dir} (not yet created)")
+
+    master = _load_master_tags(work_dir)
+    lines.append(f"  Master taxonomy tags: {len(master)}")
+
+    if os.path.isfile(LAST_DUMP_FAILURE_PATH):
+        try:
+            with open(LAST_DUMP_FAILURE_PATH, "r") as f:
+                rec = json.load(f)
+            lines.append(
+                f"  Last dump failure: {rec.get('error_type', '?')} "
+                f"on layer={rec.get('layer', '?')} "
+                f"at {rec.get('timestamp', '?')}"
+            )
+            lines.append(f"    log: {LAST_DUMP_FAILURE_PATH}")
+        except (OSError, json.JSONDecodeError):
+            lines.append(f"  Last dump failure log: {LAST_DUMP_FAILURE_PATH} (unreadable)")
+    return "\n".join(lines)
+
+
+def _last_message_is_clean_boundary(messages: list) -> bool:
+    """True iff the last message is a complete assistant turn with no
+    orphaned tool_calls awaiting matching tool responses.
+
+    A clean boundary is required before a checkpoint cycle so that the
+    rebuilt message list preserves OpenAI/oMLX tool-call/tool-response pairing.
+    """
+    if not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return False
+    role = last.get("role")
+    # An assistant message with tool_calls means the matching tool responses
+    # have not yet been appended. Not a clean boundary.
+    if role == "assistant":
+        return not last.get("tool_calls")
+    # If the last message is a tool response, walk backward and confirm every
+    # tool_calls id from the most recent assistant turn has a matching response.
+    if role == "tool":
+        # Find the most recent assistant message with tool_calls.
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = {tc.get("id") for tc in msg["tool_calls"] if isinstance(tc, dict)}
+                seen_ids = set()
+                for j in range(i + 1, len(messages)):
+                    m2 = messages[j]
+                    if isinstance(m2, dict) and m2.get("role") == "tool":
+                        seen_ids.add(m2.get("tool_call_id"))
+                return expected_ids.issubset(seen_ids)
+            if msg.get("role") == "assistant":
+                # Reached an earlier assistant turn without tool_calls -- safe.
+                return True
+        return True
+    # user/system as the last message means no in-flight assistant turn.
+    return role in ("user", "system")
+
+
+def _estimate_dump_overhead_tokens(messages: list) -> int:
+    """Conservative estimate of how many prompt tokens the snapshot request
+    itself will consume (the model still has to read the existing messages
+    to fill the snapshot template). Plus the reserve for its output."""
+    # Estimate input cost as ~64 tokens per message (header + structural overhead;
+    # the message bodies are already in context). Add reserve for output.
+    return max(1, len(messages)) * 64 + CONTEXT_SNAPSHOT_RESERVE
+
+
+def _should_dump(layer: str, prompt_tokens: int, messages: list, model: str) -> bool:
+    """Decide whether a checkpoint cycle should fire for this layer right now.
+
+    All three conditions must hold:
+      - prompt_tokens / model_limit >= CONTEXT_DUMP_THRESHOLD
+      - the message list ends on a clean turn boundary
+      - a pre-flight estimate keeps total usage under CONTEXT_DUMP_HARD_CEILING
+    """
+    if not prompt_tokens or prompt_tokens <= 0:
+        return False
+    limit = get_model_context_limit(model)
+    if limit <= 0:
+        return False
+    pct = prompt_tokens / limit
+    if pct < CONTEXT_DUMP_THRESHOLD:
+        return False
+    if not _last_message_is_clean_boundary(messages):
+        return False
+    overhead = _estimate_dump_overhead_tokens(messages)
+    if (prompt_tokens + overhead) / limit > CONTEXT_DUMP_HARD_CEILING:
+        return False
+    return True
+
+
+def _parse_context_limit_arg(raw: str) -> tuple[str, int]:
+    """Parse a `--context-limit MODEL=N` value. Raises ValueError on bad input."""
+    if "=" not in raw:
+        raise ValueError(f"expected MODEL=N, got {raw!r}")
+    model, _, limit_str = raw.partition("=")
+    model = model.strip()
+    if not model:
+        raise ValueError("model name cannot be empty")
+    try:
+        limit = int(limit_str.strip())
+    except ValueError as exc:
+        raise ValueError(f"limit must be an integer, got {limit_str!r}") from exc
+    if limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+    return model, limit
+
+
+# Load any persisted per-model overrides at import time so all layers see them.
+_load_model_context_overrides()
+
+
+# ── Snapshot generation and message-list rebuild (U2) ────────────────────────
+# Builds a CONTEXT_SNAPSHOT v1 document from the live message list, then
+# rebuilds the layer's message list around that snapshot. U6 wires this into
+# the live agent loop with the dump-to-disk side effects from U3.
+
+SNAPSHOT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "Active Task",
+    "Current Step",
+    "Decisions Made",
+    "Ruled Out / Don't Retry",
+    "Verified Facts",
+    "Unverified Assumptions",
+    "Open Questions",
+    "Files Touched",
+    "Next Intended Action",
+)
+
+SNAPSHOT_TEMPLATE = """CONTEXT_SNAPSHOT v1
+
+You are about to lose the bulk of your working context to make room for new
+work. Fill in EVERY section below using ONLY information already present in
+this conversation. Do not invent facts.
+
+Rules:
+- Use the EXACT section headings shown, prefixed with `## `.
+- Every section is mandatory. If a section is genuinely empty, write the
+  literal text `(none)` on its own line.
+- The `## Ruled Out / Don't Retry` section is the most important: record any
+  approach, tool call, file edit, or hypothesis that was tried and rejected,
+  so a future agent does not repeat it.
+- Be concise but specific. Prefer file paths, function names, and exact error
+  strings over paraphrase.
+- Do NOT call any tools. Output only the filled-in template.
+
+Template:
+
+## Active Task
+<one or two sentences describing the goal currently being pursued>
+
+## Current Step
+<the immediate next thing being worked on>
+
+## Decisions Made
+<bulleted list of decisions reached so far>
+
+## Ruled Out / Don't Retry
+<bulleted list of approaches that were tried and rejected, with the reason>
+
+## Verified Facts
+<bulleted list of facts verified by tool calls or file reads in this conversation>
+
+## Unverified Assumptions
+<bulleted list of assumptions made but not yet verified>
+
+## Open Questions
+<bulleted list of questions still outstanding>
+
+## Files Touched
+<bulleted list of file paths edited or created in this conversation>
+
+## Next Intended Action
+<the very next action you plan to take after this snapshot>
+"""
+
+
+class SnapshotInvalid(Exception):
+    """Raised when a snapshot response is missing required fields."""
+
+    def __init__(self, missing: list[str], raw_text: str = ""):
+        self.missing = list(missing)
+        self.raw_text = raw_text
+        super().__init__(
+            f"snapshot missing required fields: {', '.join(self.missing)}"
+        )
+
+
+def _parse_snapshot_sections(text: str) -> dict[str, str]:
+    """Split a snapshot body into a {heading: body_text} dict.
+
+    Headings are recognised as lines that start with `## ` (markdown H2).
+    Body text is everything between one heading and the next, stripped.
+    """
+    sections: dict[str, str] = {}
+    current: str | None = None
+    buf: list[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("## "):
+            if current is not None:
+                sections[current] = "\n".join(buf).strip()
+            current = stripped[3:].strip()
+            buf = []
+        else:
+            if current is not None:
+                buf.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buf).strip()
+    return sections
+
+
+def _validate_snapshot(text: str) -> dict[str, str]:
+    """Parse and validate a snapshot body. Raises SnapshotInvalid on failure.
+
+    A section is considered missing if its heading is absent OR its body is
+    empty. Note: the literal token `(none)` counts as a non-empty body and is
+    the supported way to mark a section as having nothing to record.
+    """
+    sections = _parse_snapshot_sections(text)
+    missing: list[str] = []
+    for field in SNAPSHOT_REQUIRED_FIELDS:
+        body = sections.get(field, "").strip()
+        if not body:
+            missing.append(field)
+    if missing:
+        raise SnapshotInvalid(missing, raw_text=text or "")
+    return {field: sections[field].strip() for field in SNAPSHOT_REQUIRED_FIELDS}
+
+
+def _format_snapshot_for_injection(snapshot: dict[str, str]) -> str:
+    """Format a validated snapshot as the body of a system message."""
+    lines = ["CONTEXT_SNAPSHOT v1 (auto-generated checkpoint)", ""]
+    for field in SNAPSHOT_REQUIRED_FIELDS:
+        lines.append(f"## {field}")
+        lines.append(snapshot[field])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _request_snapshot(messages: list, model: str, api_call_fn=None) -> dict[str, str]:
+    """Ask ``model`` to fill in the snapshot template against ``messages``.
+
+    Returns the validated section dict. Raises SnapshotInvalid if the model's
+    response is missing required fields, or RuntimeError if the API call
+    itself failed.
+
+    ``api_call_fn`` is injected for tests; production callers omit it and the
+    module-level ``api_call`` is used.
+    """
+    if api_call_fn is None:
+        api_call_fn = api_call
+    snapshot_messages = list(messages) + [
+        {
+            "role": "user",
+            "content": SNAPSHOT_TEMPLATE,
+        }
+    ]
+    # Pass tools=[] so the model cannot call tools mid-snapshot.
+    response = api_call_fn(snapshot_messages, model, tools=[])
+    if not response or response.get("_context_overflow"):
+        raise RuntimeError("snapshot api_call returned no usable response")
+    parsed = normalize_api_response(response)
+    text = parsed.get("text", "") or ""
+    return _validate_snapshot(text)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap token estimate: ~4 chars per token. Matches the plan's heuristic."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _message_token_estimate(msg: dict) -> int:
+    """Rough token cost of a single message including role/structural overhead."""
+    if not isinstance(msg, dict):
+        return 8
+    body = ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        body = content
+    elif isinstance(content, list):
+        # OpenAI multipart content arrays.
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("text") or item.get("content") or ""
+                if isinstance(t, str):
+                    parts.append(t)
+        body = "\n".join(parts)
+    # Tool calls and tool responses carry their own payloads.
+    tool_calls = msg.get("tool_calls") or []
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                body += "\n" + str(fn.get("name", "")) + "\n" + str(fn.get("arguments", ""))
+    if msg.get("tool_call_id"):
+        body += "\n" + str(msg["tool_call_id"])
+    # 8 token overhead for role + structural tokens.
+    return 8 + _estimate_tokens(body)
+
+
+def _is_assistant_with_tool_calls(msg: dict) -> bool:
+    return (
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and bool(msg.get("tool_calls"))
+    )
+
+
+def _safe_tail_slice(messages: list, budget_tokens: int) -> list:
+    """Return the longest suffix of ``messages`` that:
+
+    1. Costs no more than ``budget_tokens`` (rough estimate).
+    2. Ends on a complete assistant turn (i.e. either an assistant message
+       with no pending tool_calls, OR a `tool` response message that
+       satisfies an earlier assistant tool_calls).
+    3. Does not begin in the middle of a tool_calls / tool-response group
+       (i.e. the slice never includes a `role: "tool"` message without the
+       assistant message that issued the matching tool_calls).
+
+    Always returns at least the last complete assistant turn (cannot shrink
+    below one), even if that exceeds the budget — this is required so the
+    rebuilt list still has a meaningful continuation point.
+    """
+    if not messages:
+        return []
+
+    # Step 1: walk backwards, accumulating tokens, stopping when the next
+    # message would exceed the budget. Track the earliest index we keep.
+    n = len(messages)
+    accumulated = 0
+    keep_from = n  # exclusive: messages[keep_from:] is the slice
+    for i in range(n - 1, -1, -1):
+        cost = _message_token_estimate(messages[i])
+        if accumulated + cost > budget_tokens and keep_from < n:
+            break
+        accumulated += cost
+        keep_from = i
+
+    # Step 2: if the slice begins on a `tool` response, walk further back to
+    # include the assistant message that issued the tool_calls. If we cannot
+    # find a matching assistant message inside the slice's reachable history,
+    # advance keep_from past the orphaned tool responses instead.
+    while keep_from < n and isinstance(messages[keep_from], dict) and messages[keep_from].get("role") == "tool":
+        # Look for the assistant that issued this tool_call.
+        target_id = messages[keep_from].get("tool_call_id")
+        owner_idx = None
+        for j in range(keep_from - 1, -1, -1):
+            m = messages[j]
+            if _is_assistant_with_tool_calls(m):
+                ids = {tc.get("id") for tc in m["tool_calls"] if isinstance(tc, dict)}
+                if target_id in ids:
+                    owner_idx = j
+                break
+        if owner_idx is None:
+            # Orphaned tool message — drop it from the slice.
+            keep_from += 1
+            continue
+        keep_from = owner_idx
+
+    # Step 3: ensure the slice ends on a complete assistant turn. If the
+    # final assistant message has tool_calls but its matching tool responses
+    # are missing, we must walk backwards past it.
+    while keep_from < n:
+        last = messages[n - 1]
+        if not _is_assistant_with_tool_calls(last):
+            break
+        # Check whether all tool_calls have matching tool responses inside
+        # messages[keep_from:n].
+        expected = {tc.get("id") for tc in last["tool_calls"] if isinstance(tc, dict)}
+        seen: set = set()
+        for k in range(n - 1, keep_from - 1, -1):
+            m = messages[k]
+            if isinstance(m, dict) and m.get("role") == "tool":
+                seen.add(m.get("tool_call_id"))
+        if expected.issubset(seen):
+            break
+        # In-flight tool_calls at the tail (this should not happen because
+        # _should_dump's clean-boundary guard filters this case out, but we
+        # defend in depth here). Drop the trailing assistant turn.
+        n -= 1
+
+    # Guarantee: never return an empty slice while there exists at least one
+    # message — fall back to the last message (and its surrounding tool group
+    # if needed) so the rebuilt list has continuation context.
+    if keep_from >= n:
+        keep_from = max(0, len(messages) - 1)
+        n = len(messages)
+        # Re-apply the orphan guard for the singleton case.
+        while keep_from < n and isinstance(messages[keep_from], dict) and messages[keep_from].get("role") == "tool":
+            keep_from += 1
+        if keep_from >= n:
+            return []
+
+    return list(messages[keep_from:n])
+
+
+def _find_first_user_message_index(messages: list) -> int | None:
+    """Return the index of the first ``role: "user"`` message, or None."""
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return i
+    return None
+
+
+def _rebuild_messages_with_snapshot(
+    messages: list,
+    snapshot: dict[str, str],
+    *,
+    first_user_idx: int | None = None,
+    tail_budget_tokens: int = 2048,
+) -> list:
+    """Construct the post-checkpoint message list.
+
+    Order: [original_system_messages] + [first_user_prompt_of_contextID]
+        + [snapshot as system message] + [_safe_tail_slice(messages, budget)]
+
+    - All leading ``role: "system"`` messages are preserved verbatim.
+    - The first user message is taken at ``first_user_idx`` if provided,
+      otherwise the first user message in ``messages`` is used (U2 fallback;
+      U6 will pass the contextID-scoped index).
+    - The snapshot is injected as a single ``role: "system"`` message whose
+      body is the formatted snapshot.
+    - The tail slice is computed against ``messages`` and is guaranteed to
+      end on a clean assistant turn.
+    - Duplicate inclusion is avoided: if the first user message also appears
+      inside the tail slice, it is not repeated.
+    """
+    if not messages:
+        return []
+
+    # Leading system messages.
+    leading_system: list = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            leading_system.append(m)
+        else:
+            break
+
+    # First user prompt (contextID-scoped if known, else first overall).
+    if first_user_idx is None:
+        first_user_idx = _find_first_user_message_index(messages)
+    first_user_msg = None
+    if first_user_idx is not None and 0 <= first_user_idx < len(messages):
+        candidate = messages[first_user_idx]
+        if isinstance(candidate, dict) and candidate.get("role") == "user":
+            first_user_msg = candidate
+
+    # Snapshot system message.
+    snapshot_msg = {
+        "role": "system",
+        "content": _format_snapshot_for_injection(snapshot),
+    }
+
+    # Tail slice.
+    tail = _safe_tail_slice(messages, tail_budget_tokens)
+
+    # Drop anything from the tail that we already included as the prefix
+    # (leading system messages and the first user message). Compare by
+    # identity since these are the same dict objects from ``messages``.
+    prefix_ids = {id(m) for m in leading_system}
+    if first_user_msg is not None:
+        prefix_ids.add(id(first_user_msg))
+    tail = [m for m in tail if id(m) not in prefix_ids]
+
+    rebuilt: list = []
+    rebuilt.extend(leading_system)
+    if first_user_msg is not None:
+        rebuilt.append(first_user_msg)
+    rebuilt.append(snapshot_msg)
+    rebuilt.extend(tail)
+    return rebuilt
+
+
+# ── Tag taxonomy and dump file format (U3) ───────────────────────────────────
+# On-disk archive of pre-checkpoint message lists with section anchors and
+# per-section tag headers. The contextID-scoped index.md is load-bearing for
+# the U4 recall_context tool: tag -> [{file, anchor}] lookups happen there.
+#
+# Layout (under WORK_DIR):
+#   .currentContext/
+#       contextTags.md                       # master taxonomy
+#       YYYY-MM-DD/
+#           HHMMSS-xxxx/                     # one per user-minted contextID
+#               dump-HHMMSS.md
+#               index.md
+
+CURRENT_CONTEXT_DIR = ".currentContext"
+CONTEXT_TAGS_FILE = "contextTags.md"
+SECTION_SPLIT_TOKEN_THRESHOLD = 2000  # split a single message into multiple sections beyond this
+
+
+def _context_root(work_dir: str | None = None) -> str:
+    """Absolute path to the .currentContext root for ``work_dir`` (default WORK_DIR)."""
+    base = work_dir if work_dir is not None else WORK_DIR
+    return os.path.join(base, CURRENT_CONTEXT_DIR)
+
+
+def _master_tags_path(work_dir: str | None = None) -> str:
+    return os.path.join(_context_root(work_dir), CONTEXT_TAGS_FILE)
+
+
+def _context_dir_for_id(context_id: str, *, work_dir: str | None = None,
+                       date_str: str | None = None) -> str:
+    """Directory `<root>/YYYY-MM-DD/<context_id>/` for a given contextID."""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(_context_root(work_dir), date_str, context_id)
+
+
+def _anchor_for(idx: int) -> str:
+    """Return the section anchor id for the 1-based section index ``idx``."""
+    return f"s-{idx:03d}"
+
+
+def _split_messages_into_sections(messages: list) -> list[dict]:
+    """Group messages into role-coherent sections.
+
+    A section is a list of consecutive messages anchored on a single assistant
+    turn: the assistant message plus any directly preceding user/tool messages
+    it answered. Leading system messages each form their own section so the
+    snapshot context (system role) stays addressable.
+
+    If a single message exceeds SECTION_SPLIT_TOKEN_THRESHOLD tokens, it is
+    split into multiple sections of roughly that size (so each anchor stays
+    independently tag-able).
+
+    Returns a list of dicts: {"role": str, "messages": [...], "preview": str}
+    where ``preview`` is the first ~200 chars of the section body for tag
+    suggestion prompts.
+    """
+    sections: list[dict] = []
+    if not messages:
+        return sections
+
+    pending: list[dict] = []  # user/tool messages buffered until next assistant
+
+    def _emit(role: str, msgs: list[dict]) -> None:
+        if not msgs:
+            return
+        body = _section_body_text(msgs)
+        # Token-budget split.
+        if _estimate_tokens(body) <= SECTION_SPLIT_TOKEN_THRESHOLD:
+            sections.append({"role": role, "messages": list(msgs),
+                             "preview": body[:200]})
+            return
+        # Oversized: chop the body into ~SECTION_SPLIT_TOKEN_THRESHOLD chunks,
+        # represent each chunk as its own section. Original messages are kept
+        # together in the first chunk's `messages` list so retrieval can read
+        # the underlying source if needed.
+        chunk_chars = SECTION_SPLIT_TOKEN_THRESHOLD * 4
+        chunks = [body[i:i + chunk_chars] for i in range(0, len(body), chunk_chars)]
+        for chunk_i, chunk in enumerate(chunks):
+            sections.append({
+                "role": role,
+                "messages": list(msgs) if chunk_i == 0 else [],
+                "preview": chunk[:200],
+                "split_chunk": chunk_i,
+                "split_total": len(chunks),
+                "body_override": chunk,
+            })
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            _emit("system", [m])
+            continue
+        if role in ("user", "tool"):
+            pending.append(m)
+            continue
+        if role == "assistant":
+            group = pending + [m]
+            pending = []
+            _emit("assistant", group)
+            continue
+        # Unknown role: emit as its own section to avoid losing it.
+        _emit(role or "unknown", [m])
+
+    # Any trailing user/tool messages without an assistant reply still need an
+    # anchor so they can be archived and tagged.
+    if pending:
+        _emit(pending[-1].get("role") or "user", pending)
+
+    return sections
+
+
+def _section_body_text(msgs: list[dict]) -> str:
+    """Render a list of messages as plain text for tag-suggestion + previews."""
+    lines: list[str] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "?")
+        content = m.get("content")
+        body = ""
+        if isinstance(content, str):
+            body = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    t = item.get("text") or item.get("content") or ""
+                    if isinstance(t, str):
+                        parts.append(t)
+            body = "\n".join(parts)
+        lines.append(f"[{role}] {body}".rstrip())
+        # Tool calls: render their function name + arguments preview.
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                lines.append(
+                    f"[{role}.tool_call] {fn.get('name', '')}"
+                    f"({fn.get('arguments', '')})"
+                )
+        if m.get("tool_call_id"):
+            lines.append(f"[tool_call_id] {m['tool_call_id']}")
+    return "\n".join(lines).strip()
+
+
+def _render_dump_markdown(
+    *,
+    context_id: str,
+    sections: list[dict],
+    tags_by_section: dict[str, list[str]],
+    timestamp: str | None = None,
+) -> str:
+    """Render a dump file as markdown.
+
+    Top of file: contextID + timestamp metadata, then a `## Section Tags`
+    table mapping `tag -> [s-001, s-014]` so the index can be rebuilt from
+    just the dump if needed. Then one fenced section per anchor.
+    """
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    out: list[str] = []
+    out.append(f"# Context Dump {context_id}")
+    out.append(f"_generated: {timestamp}_")
+    out.append("")
+    out.append("## Section Tags")
+    # Build inverse: tag -> [anchors]
+    tag_to_anchors: dict[str, list[str]] = {}
+    for anchor, tags in tags_by_section.items():
+        for tag in tags:
+            tag_to_anchors.setdefault(tag, []).append(anchor)
+    if not tag_to_anchors:
+        out.append("_(no tags)_")
+    else:
+        for tag in sorted(tag_to_anchors):
+            anchors = sorted(set(tag_to_anchors[tag]))
+            out.append(f"- `{tag}` -> {', '.join(anchors)}")
+    out.append("")
+    out.append("## Sections")
+    out.append("")
+    for idx, sec in enumerate(sections, start=1):
+        anchor = _anchor_for(idx)
+        section_tags = tags_by_section.get(anchor, [])
+        out.append(f'<a id="{anchor}"></a>')
+        out.append(f"### {anchor} role: {sec.get('role', '?')}")
+        if "split_chunk" in sec:
+            out.append(
+                f"_split chunk {sec['split_chunk'] + 1}/{sec['split_total']}_"
+            )
+        if section_tags:
+            out.append(f"**tags:** {', '.join(section_tags)}")
+        else:
+            out.append("**tags:** _(none)_")
+        out.append("")
+        out.append("```text")
+        body = sec.get("body_override")
+        if body is None:
+            body = _section_body_text(sec.get("messages", []))
+        out.append(body)
+        out.append("```")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _load_master_tags(work_dir: str | None = None) -> set[str]:
+    """Read the master taxonomy file and return the set of canonical tags.
+
+    File format: one tag per line, optionally followed by ` # description`.
+    Lines beginning with `## added:` or `## normalized:` are metadata and
+    contribute the tag mentioned in the `## added: <tag> -- <reason>` form to
+    the canonical set (so once-added tags are remembered).
+    Malformed files (e.g. binary garbage) are treated as empty rather than
+    raising — the dump path must never crash on a corrupt taxonomy file.
+    """
+    path = _master_tags_path(work_dir)
+    if not os.path.isfile(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return set()
+    tags: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("## added:"):
+            # `## added: <tag> -- <reason>`
+            rest = line[len("## added:"):].strip()
+            if "--" in rest:
+                tag = rest.split("--", 1)[0].strip()
+            else:
+                tag = rest.strip()
+            if tag and _is_valid_tag(tag):
+                tags.add(tag)
+            continue
+        if line.startswith("## normalized:") or line.startswith("#"):
+            # Metadata line (or a markdown comment). Skip.
+            continue
+        # Strip optional inline description.
+        if " # " in line:
+            tag = line.split(" # ", 1)[0].strip()
+        else:
+            tag = line
+        if tag and _is_valid_tag(tag):
+            tags.add(tag)
+    return tags
+
+
+def _is_valid_tag(tag: str) -> bool:
+    """A tag is a short, single-line, mostly-printable token."""
+    if not tag or len(tag) > 80:
+        return False
+    if "\n" in tag or "\r" in tag:
+        return False
+    # Reject anything that looks like binary or HTML markup garbage.
+    return all(c.isprintable() and c not in "<>" for c in tag)
+
+
+def _append_master_tags(
+    new_tags: list[tuple[str, str]],
+    *,
+    work_dir: str | None = None,
+) -> list[str]:
+    """Atomically append `## added: <tag> -- <reason>` lines for new tags.
+
+    ``new_tags`` is a list of ``(tag, reason)`` pairs. Tags already present in
+    the master set are skipped. Returns the list of tags actually appended.
+    """
+    accepted: list[str] = []
+    if not new_tags:
+        return accepted
+    existing = _load_master_tags(work_dir)
+    additions: list[str] = []
+    for tag, reason in new_tags:
+        if not _is_valid_tag(tag):
+            continue
+        if tag in existing:
+            continue
+        reason_clean = (reason or "").strip().replace("\n", " ").replace("\r", " ")
+        if not reason_clean:
+            reason_clean = "(no reason given)"
+        additions.append(f"## added: {tag} -- {reason_clean}")
+        accepted.append(tag)
+    if not additions:
+        return accepted
+    path = _master_tags_path(work_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Read existing file (if any) and append; write to .tmp then os.replace.
+    prior = ""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                prior = f.read()
+        except OSError:
+            prior = ""
+    if prior and not prior.endswith("\n"):
+        prior += "\n"
+    if not prior:
+        prior = "# Context Tags Master Taxonomy\n\n"
+    new_text = prior + "\n".join(additions) + "\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, path)
+    return accepted
+
+
+def _request_section_tags(
+    sections: list[dict],
+    master_tags: set[str],
+    model: str,
+    *,
+    api_call_fn=None,
+) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
+    """Ask ``model`` to assign tags to each section.
+
+    Returns ``(tags_by_section, new_tags)`` where:
+      - ``tags_by_section`` maps anchor -> list of tag strings
+      - ``new_tags`` is a list of ``(tag, reason)`` pairs the model proposed
+        as additions to the master taxonomy.
+
+    On any parse failure or empty model response, returns empty dicts rather
+    than raising — the caller writes the dump regardless (anchors with empty
+    tag lists are still indexable by anchor for direct retrieval).
+    """
+    if api_call_fn is None:
+        api_call_fn = api_call
+    if not sections:
+        return {}, []
+
+    # Build a compact prompt enumerating sections + master tag list.
+    section_lines = []
+    anchors: list[str] = []
+    for idx, sec in enumerate(sections, start=1):
+        anchor = _anchor_for(idx)
+        anchors.append(anchor)
+        preview = sec.get("preview", "")
+        section_lines.append(
+            f"### {anchor} (role: {sec.get('role', '?')})\n{preview}"
+        )
+    master_list = sorted(master_tags)
+
+    instructions = (
+        "You are tagging conversation sections so they can be retrieved later "
+        "by tag. Follow these rules strictly:\n"
+        "1. Prefer tags from the EXISTING TAGS list when applicable.\n"
+        "2. Only propose a NEW tag if no existing tag fits.\n"
+        "3. Each new tag MUST come with a one-line justification.\n"
+        "4. Tags are short (1-3 words), lowercase, hyphen-separated.\n"
+        "5. Output VALID JSON ONLY, matching this schema exactly:\n"
+        '   {"sections": {"s-001": ["tag1", "tag2"], ...}, '
+        '"new_tags": [{"tag": "...", "reason": "..."}]}\n'
+        "Do not call any tools. Do not include explanation prose."
+    )
+    user_msg = (
+        f"EXISTING TAGS:\n{', '.join(master_list) if master_list else '(none)'}\n\n"
+        f"SECTIONS TO TAG:\n" + "\n\n".join(section_lines)
+    )
+    response = api_call_fn(
+        [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": user_msg},
+        ],
+        model,
+        tools=[],
+    )
+    if not response or response.get("_context_overflow"):
+        return {a: [] for a in anchors}, []
+    parsed = normalize_api_response(response)
+    text = (parsed.get("text") or "").strip()
+    payload = _safe_extract_json_object(text)
+    if not isinstance(payload, dict):
+        return {a: [] for a in anchors}, []
+
+    raw_sections = payload.get("sections") or {}
+    tags_by_section: dict[str, list[str]] = {}
+    if isinstance(raw_sections, dict):
+        for anchor in anchors:
+            entry = raw_sections.get(anchor) or []
+            cleaned: list[str] = []
+            if isinstance(entry, list):
+                for t in entry:
+                    if isinstance(t, str):
+                        tag = t.strip().lower()
+                        if _is_valid_tag(tag):
+                            cleaned.append(tag)
+            tags_by_section[anchor] = cleaned
+
+    raw_new = payload.get("new_tags") or []
+    new_tags: list[tuple[str, str]] = []
+    if isinstance(raw_new, list):
+        for entry in raw_new:
+            if isinstance(entry, dict):
+                tag = (entry.get("tag") or "").strip().lower()
+                reason = (entry.get("reason") or "").strip()
+                if _is_valid_tag(tag) and tag not in master_tags:
+                    new_tags.append((tag, reason))
+    return tags_by_section, new_tags
+
+
+def _safe_extract_json_object(text: str) -> dict | None:
+    """Best-effort parse of a JSON object from a model response.
+
+    Tries the whole string first, then falls back to the substring between
+    the first ``{`` and the last ``}``.
+    """
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _read_index(index_path: str) -> dict[str, list[dict]]:
+    """Read a contextID-scoped index.md and return tag -> [{file, anchor}]."""
+    if not os.path.isfile(index_path):
+        return {}
+    try:
+        with open(index_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    try:
+        # Index is stored as JSON inside a fenced code block for human read +
+        # machine parse. Fallback: try parsing the whole file as JSON.
+        if "```json" in text:
+            body = text.split("```json", 1)[1].split("```", 1)[0]
+        else:
+            body = text
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            return {}
+        result: dict[str, list[dict]] = {}
+        for tag, hits in data.items():
+            if isinstance(tag, str) and isinstance(hits, list):
+                cleaned: list[dict] = []
+                for hit in hits:
+                    if isinstance(hit, dict) and hit.get("file") and hit.get("anchor"):
+                        cleaned.append({"file": str(hit["file"]),
+                                        "anchor": str(hit["anchor"])})
+                if cleaned:
+                    result[tag] = cleaned
+        return result
+    except (json.JSONDecodeError, IndexError):
+        return {}
+
+
+def _write_index(index_path: str, index: dict[str, list[dict]]) -> None:
+    """Write a contextID-scoped index.md atomically."""
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    # Sort tags + dedupe hits for stable diffs.
+    normalized: dict[str, list[dict]] = {}
+    for tag in sorted(index):
+        seen: set[tuple[str, str]] = set()
+        ordered: list[dict] = []
+        for hit in index[tag]:
+            key = (hit.get("file", ""), hit.get("anchor", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append({"file": hit.get("file", ""),
+                            "anchor": hit.get("anchor", "")})
+        normalized[tag] = ordered
+    body = json.dumps(normalized, indent=2, sort_keys=True)
+    text = (
+        "# Context Tag Index\n\n"
+        "_machine-readable index of `tag -> [{file, anchor}]` for this contextID._\n\n"
+        "```json\n" + body + "\n```\n"
+    )
+    tmp = index_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, index_path)
+
+
+def _update_index_with_dump(
+    index_path: str,
+    dump_filename: str,
+    tags_by_section: dict[str, list[str]],
+) -> dict[str, list[dict]]:
+    """Load index.md, merge in the new dump's anchors, write it back atomically."""
+    index = _read_index(index_path)
+    for anchor, tags in tags_by_section.items():
+        for tag in tags:
+            index.setdefault(tag, []).append({"file": dump_filename,
+                                              "anchor": anchor})
+    _write_index(index_path, index)
+    return index
+
+
+def _write_dump_file(
+    context_id: str,
+    sections: list[dict],
+    tags_by_section: dict[str, list[str]],
+    *,
+    work_dir: str | None = None,
+    timestamp: str | None = None,
+) -> tuple[str, str]:
+    """Write `dump-HHMMSS.md` and update the contextID-scoped index.md.
+
+    Returns ``(dump_path, index_path)`` (both absolute).
+    """
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%H%M%S")
+    ctx_dir = _context_dir_for_id(context_id, work_dir=work_dir)
+    os.makedirs(ctx_dir, exist_ok=True)
+    dump_filename = f"dump-{timestamp}.md"
+    dump_path = os.path.join(ctx_dir, dump_filename)
+    text = _render_dump_markdown(
+        context_id=context_id,
+        sections=sections,
+        tags_by_section=tags_by_section,
+        timestamp=timestamp,
+    )
+    tmp = dump_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, dump_path)
+    index_path = os.path.join(ctx_dir, "index.md")
+    _update_index_with_dump(index_path, dump_filename, tags_by_section)
+    return dump_path, index_path
+
+
+# ── checkpoint cycle (U6) ────────────────────────────────────────────────────
+# Composes U2 (snapshot + rebuild), U3 (sections + tags + dump file), and U5
+# (active contextID) into a single function the agent loop can call when the
+# trigger fires. Any failure inside the cycle falls back to emergency_trim and
+# leaves a ~/.omlx/last_dump_failure.json forensic record.
+
+LAST_DUMP_FAILURE_PATH = os.path.expanduser("~/.omlx/last_dump_failure.json")
+
+
+def _record_dump_failure(record: dict) -> None:
+    """Best-effort write of ~/.omlx/last_dump_failure.json. Never raises."""
+    try:
+        os.makedirs(os.path.dirname(LAST_DUMP_FAILURE_PATH), exist_ok=True)
+        tmp = LAST_DUMP_FAILURE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, sort_keys=True, default=str)
+        os.replace(tmp, LAST_DUMP_FAILURE_PATH)
+    except Exception:
+        pass
+
+
+def run_checkpoint_cycle(
+    layer: str,
+    messages: list,
+    model: str,
+    *,
+    work_dir: str | None = None,
+    api_call_fn=None,
+    original_token_count: int = 0,
+) -> tuple[list, dict | None]:
+    """Run the proactive context-management cycle for ``layer``.
+
+    On success: snapshots the current message list, splits it into sections,
+    asks the model to tag each section, writes a ``dump-HHMMSS.md`` + updates
+    ``index.md``, and returns ``(rebuilt_messages, result)`` where the
+    rebuilt list is the new working message list for ``layer``.
+
+    On failure (snapshot invalid, network error, disk error, malformed
+    response): writes ``~/.omlx/last_dump_failure.json``, calls
+    ``emergency_trim`` on the original ``messages``, and returns
+    ``(trimmed_messages, {"fallback": True, ...})``.
+
+    Returns ``(messages, None)`` on caller-side guard misses (no contextID
+    could be minted, etc.).
+    """
+    import urllib.error
+
+    layer_state = _get_layer_state(layer)
+    context_id = _active_context_id or layer_state.get("context_id")
+    if not context_id:
+        # No mint yet (e.g. initial system message turn). Mint defensively
+        # so the dump has somewhere to live.
+        context_id = _mint_context_id()
+        layer_state["context_id"] = context_id
+
+    try:
+        snapshot = _request_snapshot(messages, model, api_call_fn=api_call_fn)
+        sections = _split_messages_into_sections(messages)
+        master_tags = _load_master_tags(work_dir)
+        tags_by_section, new_tags = _request_section_tags(
+            sections, master_tags, model, api_call_fn=api_call_fn,
+        )
+        if new_tags:
+            _append_master_tags(new_tags, work_dir=work_dir)
+        dump_path, index_path = _write_dump_file(
+            context_id, sections, tags_by_section, work_dir=work_dir,
+        )
+        first_user_idx = layer_state.get("first_user_msg_idx")
+        if first_user_idx is None:
+            first_user_idx = _find_first_user_message_index(messages)
+        rebuilt = _rebuild_messages_with_snapshot(
+            messages, snapshot, first_user_idx=first_user_idx,
+        )
+        new_token_count = sum(_message_token_estimate(m) for m in rebuilt)
+        layer_state["dump_count"] = layer_state.get("dump_count", 0) + 1
+        return rebuilt, {
+            "fallback": False,
+            "context_id": context_id,
+            "layer": layer,
+            "dump_path": dump_path,
+            "index_path": index_path,
+            "old_tokens": original_token_count,
+            "new_tokens": new_token_count,
+            "section_count": len(sections),
+            "new_tags_added": [t for t, _ in new_tags],
+        }
+    except (SnapshotInvalid, urllib.error.URLError, OSError,
+            json.JSONDecodeError, RuntimeError) as exc:
+        import traceback as _tb
+        record = {
+            "context_id": context_id,
+            "layer": layer,
+            "model": model,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": _tb.format_exc(),
+            "original_token_count": original_token_count,
+            "missing_fields": getattr(exc, "missing", None),
+            "timestamp": datetime.now().isoformat(),
+        }
+        _record_dump_failure(record)
+        trimmed = emergency_trim(messages)
+        return trimmed, {
+            "fallback": True,
+            "context_id": context_id,
+            "layer": layer,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "old_tokens": original_token_count,
+        }
+
+
+# ── recall_context tool (U4) ─────────────────────────────────────────────────
+# Worker-layer tool that lets the model retrieve specific archived sections by
+# tag from earlier in the same contextID. Per plan: not exposed to the manager
+# layer (the manager's JSON-only contract forbids tool use); registered in the
+# global TOOLS so all worker layers see it.
+
+RECALL_TOKEN_BUDGET = 4096  # max chars/4 across all returned excerpts per call
+_RECALL_DUMP_FILENAME_RE = re.compile(r"^dump-(\d{6})\.md$")
+
+
+def _list_dump_dirs_for_id(context_id: str, *, work_dir: str | None = None) -> list[str]:
+    """Return all `<root>/YYYY-MM-DD/<context_id>/` directories that exist.
+
+    Walks every dated subdirectory under ``.currentContext/`` because a long-
+    running contextID could in principle straddle a date boundary. Returned
+    list is unsorted; callers handle ordering.
+    """
+    root = _context_root(work_dir)
+    if not os.path.isdir(root):
+        return []
+    matches: list[str] = []
+    for date_entry in os.listdir(root):
+        date_dir = os.path.join(root, date_entry)
+        if not os.path.isdir(date_dir):
+            continue
+        candidate = os.path.join(date_dir, context_id)
+        if os.path.isdir(candidate):
+            matches.append(candidate)
+    return matches
+
+
+def _read_dump_section(dump_path: str, anchor: str) -> str | None:
+    """Extract the body of ``anchor`` from ``dump_path`` as plain text.
+
+    Reads the fenced ```text block immediately following the anchor's heading.
+    Returns None if the anchor is not found or the file cannot be read.
+    """
+    if not os.path.isfile(dump_path):
+        return None
+    try:
+        with open(dump_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    needle = f'<a id="{anchor}"></a>'
+    start = text.find(needle)
+    if start == -1:
+        return None
+    # Find the first ```text fence after the anchor.
+    fence_open = text.find("```text", start)
+    if fence_open == -1:
+        return None
+    body_start = text.find("\n", fence_open)
+    if body_start == -1:
+        return None
+    body_start += 1
+    fence_close = text.find("```", body_start)
+    if fence_close == -1:
+        return None
+    return text[body_start:fence_close].rstrip("\n")
+
+
+def _suggest_nearest_tags(requested: list[str], available: set[str], n: int = 3) -> list[str]:
+    """Use difflib to suggest existing tags closest to the requested ones.
+
+    Cutoff is intentionally low (0.3) because legitimate near-misses such as
+    ``auth`` vs ``authentication`` score around 0.44 due to length disparity.
+    """
+    import difflib
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    pool = sorted(available)
+    for tag in requested:
+        # Exact substring containment is also a strong hint that didn't make
+        # it through SequenceMatcher's ratio cutoff for very short queries.
+        for candidate in pool:
+            if tag and (tag in candidate or candidate in tag) and candidate not in seen:
+                suggestions.append(candidate)
+                seen.add(candidate)
+        for hit in difflib.get_close_matches(tag, pool, n=n, cutoff=0.3):
+            if hit not in seen:
+                suggestions.append(hit)
+                seen.add(hit)
+    return suggestions[: n * max(1, len(requested))]
+
+
+def tool_recall_context(
+    tags: list[str] | str,
+    context_id: str = "current",
+    limit: int = 5,
+    *,
+    work_dir: str | None = None,
+) -> str:
+    """Look up archived sections by tag from the contextID's index.
+
+    Returns a markdown-formatted string that the model can read directly.
+
+    Resolution rules:
+      - ``context_id == "current"`` resolves to the module-level
+        ``_active_context_id``. If no active id, returns an explanatory error.
+      - If every requested tag is absent from the master taxonomy, returns
+        an error string with nearest-match suggestions (never an empty list
+        masquerading as success).
+      - If the tags exist in the master taxonomy but no section in this
+        contextID matches, returns an empty-result message (not an error,
+        per origin FR9).
+      - Hits are sorted most-recent-first by ``HHMMSS`` from the dump
+        filename, then by anchor id descending within a file.
+      - Cumulative excerpt total is capped at ``RECALL_TOKEN_BUDGET``
+        (estimated as chars/4). The last hit is truncated rather than
+        silently dropped, with a `[truncated]` marker.
+    """
+    # Normalise inputs.
+    if isinstance(tags, str):
+        requested = [t.strip().lower() for t in tags.split(",") if t.strip()]
+    elif isinstance(tags, list):
+        requested = [str(t).strip().lower() for t in tags if str(t).strip()]
+    else:
+        return "[recall_context error] `tags` must be a list of strings or a comma-separated string."
+    if not requested:
+        return "[recall_context error] `tags` must contain at least one tag."
+
+    try:
+        limit_int = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit_int = 5
+
+    # Resolve contextID.
+    resolved_id = context_id
+    if not resolved_id or resolved_id == "current":
+        if not _active_context_id:
+            return ("[recall_context error] No active contextID. "
+                    "recall_context only works inside an active session.")
+        resolved_id = _active_context_id
+
+    # Resolve directories.
+    ctx_dirs = _list_dump_dirs_for_id(resolved_id, work_dir=work_dir)
+    if not ctx_dirs:
+        return f"[recall_context error] No archive found for contextID `{resolved_id}`."
+
+    # Tag taxonomy gate: if NONE of the requested tags exist in the master
+    # taxonomy, treat as a typo / wrong-vocabulary mistake and suggest.
+    master_tags = _load_master_tags(work_dir=work_dir)
+    if master_tags:
+        known = [t for t in requested if t in master_tags]
+        if not known:
+            suggestions = _suggest_nearest_tags(requested, master_tags)
+            sug_text = (", ".join(f"`{t}`" for t in suggestions)
+                        if suggestions else "(none)")
+            return (
+                f"[recall_context error] None of the requested tags exist in "
+                f"the master taxonomy: {', '.join(repr(t) for t in requested)}.\n"
+                f"Nearest existing tags: {sug_text}"
+            )
+
+    # Walk every (ctx_dir, dump_file, anchor) hit across all index.md files.
+    hits: list[dict] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for ctx_dir in ctx_dirs:
+        index_path = os.path.join(ctx_dir, "index.md")
+        index = _read_index(index_path)
+        if not index:
+            continue
+        for tag in requested:
+            for entry in index.get(tag, []):
+                file_name = entry.get("file", "")
+                anchor = entry.get("anchor", "")
+                if not file_name or not anchor:
+                    continue
+                key = (ctx_dir, file_name, anchor)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                hits.append({
+                    "ctx_dir": ctx_dir,
+                    "file": file_name,
+                    "anchor": anchor,
+                    "tag": tag,
+                })
+
+    if not hits:
+        return (f"[recall_context] No matching sections in contextID "
+                f"`{resolved_id}` for tags: {', '.join(repr(t) for t in requested)}.")
+
+    # Sort most-recent-first: HHMMSS from filename desc, then anchor desc.
+    def _sort_key(h: dict) -> tuple[int, str]:
+        m = _RECALL_DUMP_FILENAME_RE.match(h["file"])
+        ts = int(m.group(1)) if m else 0
+        return (-ts, _invert_anchor_for_sort(h["anchor"]))
+
+    hits.sort(key=_sort_key)
+    selected = hits[:limit_int]
+
+    # Read each hit's body, enforcing the cumulative budget. Last hit may be
+    # truncated rather than dropped.
+    out_lines: list[str] = [
+        f"# recall_context results: contextID `{resolved_id}`",
+        f"_tags requested: {', '.join(requested)} -- "
+        f"matched {len(hits)} section(s), returning {len(selected)}_",
+        "",
+    ]
+    budget_chars = RECALL_TOKEN_BUDGET * 4
+    used_chars = 0
+    for hit in selected:
+        dump_path = os.path.join(hit["ctx_dir"], hit["file"])
+        body = _read_dump_section(dump_path, hit["anchor"]) or ""
+        remaining = budget_chars - used_chars
+        if remaining <= 0:
+            out_lines.append(
+                f"_[recall_context: budget exhausted; "
+                f"{len(selected) - selected.index(hit)} more hit(s) omitted]_"
+            )
+            break
+        truncated = False
+        if len(body) > remaining:
+            body = body[:remaining]
+            truncated = True
+        used_chars += len(body)
+        out_lines.append(f"## {hit['file']} {hit['anchor']} (matched `{hit['tag']}`)")
+        out_lines.append("```text")
+        out_lines.append(body)
+        if truncated:
+            out_lines.append("[truncated]")
+        out_lines.append("```")
+        out_lines.append("")
+    return "\n".join(out_lines).rstrip() + "\n"
+
+
+def _invert_anchor_for_sort(anchor: str) -> str:
+    """Return a sort key that orders ``s-014`` before ``s-001`` (desc).
+
+    Anchors are zero-padded so a simple negated numeric extraction works.
+    """
+    m = re.match(r"s-(\d+)", anchor or "")
+    if not m:
+        return ""
+    # Negative number formatted as fixed width string for tuple ordering.
+    return f"-{int(m.group(1)):010d}"
+
+
 # ── Tool Definitions (OpenAI format) ─────────────────────────────────────────
 
 TOOLS = [
@@ -335,6 +2060,34 @@ TOOLS = [
                 "type": "object",
                 "properties": {},
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_context",
+            "description": "Retrieve archived conversation sections by tag from earlier in this contextID. Use when the proactive context-management system has checkpointed (you'll see a CONTEXT_SNAPSHOT system message) and you need a specific detail that was dropped from the live context. Returns markdown excerpts capped at a per-call token budget. Pass `tags` as a list of one or more existing tag strings; pass `context_id` as 'current' (default) to use the active session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "One or more tag strings to look up. Tags must come from the master taxonomy; if none match, an error with nearest-tag suggestions is returned."
+                    },
+                    "context_id": {
+                        "type": "string",
+                        "description": "ContextID to search. Defaults to 'current' (the active session). Format is HHMMSS-xxxx.",
+                        "default": "current"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of section excerpts to return (default 5). The cumulative excerpt size is also capped by RECALL_TOKEN_BUDGET.",
+                        "default": 5
+                    },
+                },
+                "required": ["tags"],
             },
         },
     },
@@ -1467,6 +3220,11 @@ TOOL_DISPATCH = {
     "ce_scan_solution_headers": lambda args: tool_ce_scan_solution_headers(args.get("directory")),
     "ce_run_agent": lambda args: tool_ce_run_agent(args["agent_name"], args["task"]),
     "ce_list_agents": lambda args: tool_ce_list_agents(),
+    "recall_context": lambda args: tool_recall_context(
+        args["tags"],
+        args.get("context_id", "current"),
+        args.get("limit", 5),
+    ),
 }
 
 
@@ -2017,11 +3775,17 @@ def _restart_omlx_server(max_wait: float = 90.0) -> bool:
         _omlx_restart_in_progress = False
 
 
-def api_call(messages: list, model: str) -> dict:
+def api_call(messages: list, model: str, tools: list | None = None) -> dict:
+    """Call the chat completions endpoint.
+
+    If ``tools`` is None (the default), the global ``TOOLS`` list is sent so
+    the model can call tools as usual. Pass ``tools=[]`` for one-shot calls
+    that must NOT trigger tool use (e.g. the context-snapshot request).
+    """
     payload = {
         "model": model,
         "messages": messages,
-        "tools": TOOLS,
+        "tools": TOOLS if tools is None else tools,
         "max_tokens": MAX_TOKENS,
     }
     data = json.dumps(payload).encode("utf-8")
@@ -4258,10 +6022,23 @@ class AgentTUI:
             lines.append(tool_git_status())
             self.add_output("\n".join(lines), C_DEFAULT)
             return
+        elif text == "/context":
+            self.add_output(
+                _format_context_state(
+                    active_layer=self.active_group,
+                    active_model=self.active_model,
+                    messages=self.messages,
+                    work_dir=WORK_DIR,
+                ),
+                C_DEFAULT,
+            )
+            return
         elif text == "/ce:flow":
+            _begin_user_chat_turn(WORK_DIR)
             self._start_managed_flow("Drive the full Compound Engineering workflow for the current task.")
             return
         elif text.startswith("/ce:flow "):
+            _begin_user_chat_turn(WORK_DIR)
             self._start_managed_flow(text[len("/ce:flow "):].strip())
             return
         elif text == "/ce:learnings":
@@ -4280,6 +6057,7 @@ class AgentTUI:
             return
 
         if self.workflow_state.active and self.active_ce_mode == "flow":
+            _begin_user_chat_turn(WORK_DIR)
             self.workflow_state.awaiting_user = False
             self.workflow_state.pending_question = ""
             self.workflow_state.manager_messages.append({
@@ -4307,6 +6085,7 @@ class AgentTUI:
                 break
 
         if ce_cmd:
+            _begin_user_chat_turn(WORK_DIR)
             # Nag (once per session) if /ce:setup hasn't been completed for this repo,
             # but never block the command and never nag /ce:setup itself.
             if ce_cmd != "setup" and not self._ce_setup_warned:
@@ -4341,6 +6120,7 @@ class AgentTUI:
             return
 
         # Normal message -- attach any [image:filename] references as multimodal content
+        _begin_user_chat_turn(WORK_DIR)
         user_content = self._build_user_content(text)
         self.messages.append({"role": "user", "content": user_content})
         self._run_agent_async()
@@ -4739,6 +6519,70 @@ class AgentTUI:
                     self._activity = f"tokens: {prompt_tok}p/{gen_tok}g"
                     self.needs_redraw = True
 
+                    # U6: per-layer trigger -> real checkpoint cycle. Re-trigger
+                    # guard: at least one full round must elapse between cycles
+                    # so a still-too-large rebuild does not loop endlessly.
+                    layer = self.active_group
+                    layer_state = _get_layer_state(layer)
+                    layer_state["last_prompt_tokens"] = prompt_tok
+                    cur_round = self.current_round
+                    last_dump_round = layer_state.get("last_dump_at_round", -1)
+                    can_redump = cur_round > last_dump_round + 1
+                    if (can_redump
+                            and _should_dump(layer, prompt_tok, self.messages, self.active_model)):
+                        limit = get_model_context_limit(self.active_model)
+                        old_pct = (prompt_tok / limit) * 100 if limit else 0
+                        self._activity = "dumping context..."
+                        self.needs_redraw = True
+                        _ts = datetime.now().strftime("%H:%M:%S")
+                        tui_print(
+                            f"[{_ts}] [context dump triggered on {layer} "
+                            f"({prompt_tok}/{limit} = {old_pct:.0f}%)]",
+                            C_DIM,
+                        )
+                        rebuilt, cycle_result = run_checkpoint_cycle(
+                            layer, self.messages, self.active_model,
+                            work_dir=WORK_DIR,
+                            original_token_count=prompt_tok,
+                        )
+                        self.messages = rebuilt
+                        layer_state["last_dump_at_round"] = cur_round
+                        layer_state["first_user_msg_idx"] = (
+                            _find_first_user_message_index(self.messages)
+                        )
+                        cid_short = (cycle_result or {}).get("context_id", "?")
+                        if cycle_result and cycle_result.get("fallback"):
+                            self._activity = (
+                                f"context dump failed -> emergency_trim "
+                                f"({cycle_result.get('error_type', '')})"
+                            )
+                            tui_print(
+                                f"[{_ts}] [context dump FAILED on {layer}: "
+                                f"{cycle_result.get('error_type', '')}: "
+                                f"{cycle_result.get('error', '')[:120]} -- "
+                                f"emergency_trim applied; see "
+                                f"~/.omlx/last_dump_failure.json]",
+                                C_RED,
+                            )
+                        elif cycle_result:
+                            new_tok = cycle_result.get("new_tokens", 0)
+                            new_pct = (new_tok / limit) * 100 if limit else 0
+                            self._activity = (
+                                f"context dump: {old_pct:.0f}% -> "
+                                f"{new_pct:.0f}%, {cid_short}"
+                            )
+                            tui_print(
+                                f"[{_ts}] [context dump {layer}: "
+                                f"{prompt_tok}p -> {new_tok}p "
+                                f"({old_pct:.0f}% -> {new_pct:.0f}%), "
+                                f"contextID={cid_short}]",
+                                C_GREEN,
+                            )
+                        self.needs_redraw = True
+                        # The rebuilt message list MUST drive the next api_call
+                        # in this round-loop iteration, so just continue.
+                        continue
+
                 if parsed["reasoning_content"]:
                     self._activity = "thinking..."
                     self.needs_redraw = True
@@ -4968,6 +6812,7 @@ HELP_TEXT = """Commands:
     /model              Switch model for a CE step group (letter + model#)
   /clear              Clear conversation
   /status             Show git status and session info
+  /context            Show proactive context-management state (contextID, dump counts, last failure)
   /quit               Exit (also Ctrl+D)
 
 Compound Engineering:
@@ -5089,7 +6934,28 @@ def main():
     parser.add_argument("--repo", default=os.getcwd(), help="Path to git repo (default: cwd)")
     parser.add_argument("--model", help="Model name (skip selection, use for all groups)")
     parser.add_argument("--no-tui", action="store_true", help="Use plain text mode (no curses TUI)")
+    parser.add_argument(
+        "--context-limit",
+        action="append",
+        default=[],
+        metavar="MODEL=N",
+        help=(
+            "Override the assumed max context window for a model "
+            "(e.g. --context-limit gpt-foo=32000). Repeatable. "
+            "Persisted to ~/.omlx/model_context_limits.json."
+        ),
+    )
     args = parser.parse_args()
+
+    # Apply any --context-limit overrides before further setup so per-layer
+    # trigger logic sees the new values immediately.
+    for raw in args.context_limit:
+        try:
+            model_name, limit_val = _parse_context_limit_arg(raw)
+        except ValueError as exc:
+            print(f"--context-limit: {exc}", file=sys.stderr)
+            sys.exit(2)
+        _save_model_context_override(model_name, limit_val)
 
     set_work_dir(args.repo)
     _rotate_temp_files()
@@ -5300,7 +7166,17 @@ def _main_plain(model_config, messages, models):
                 print(f"Todos: {done}/{len(SESSION_TODOS)} complete")
             print(tool_git_status())
             continue
+        elif user_input == "/context":
+            group = CE_MODE_TO_GROUP.get(active_ce_mode, "work")
+            print(_format_context_state(
+                active_layer=group,
+                active_model=_get_model(),
+                messages=messages,
+                work_dir=WORK_DIR,
+            ))
+            continue
         elif user_input == "/ce:flow" or user_input.startswith("/ce:flow "):
+            _begin_user_chat_turn(WORK_DIR)
             objective = user_input[len("/ce:flow "):].strip() if user_input.startswith("/ce:flow ") else "Drive the full Compound Engineering workflow for the current task."
             workflow_state = CEWorkflowState(
                 active=True,
@@ -5397,6 +7273,7 @@ def _main_plain(model_config, messages, models):
             continue
 
         if workflow_state.active and active_ce_mode == "flow":
+            _begin_user_chat_turn(WORK_DIR)
             workflow_state.awaiting_user = False
             workflow_state.pending_question = ""
             workflow_state.manager_messages.append({
@@ -5491,6 +7368,7 @@ def _main_plain(model_config, messages, models):
                 break
 
         if ce_cmd:
+            _begin_user_chat_turn(WORK_DIR)
             if ce_cmd != "setup" and not _ce_setup_warned[0]:
                 try:
                     _status = ce_setup_status(WORK_DIR)
@@ -5536,6 +7414,7 @@ def _main_plain(model_config, messages, models):
                 print("Not in a CE mode.")
             continue
 
+        _begin_user_chat_turn(WORK_DIR)
         messages.append({"role": "user", "content": user_input})
         print()
         _ensure_model_plain()
