@@ -8,6 +8,10 @@ Usage: python3 ~/omlx_agent.py [--repo /path/to/repo]
 
 import base64
 import hashlib
+import math
+import re
+import sqlite3
+from datetime import datetime, timedelta
 import curses
 import json
 import os
@@ -33,6 +37,7 @@ LEARNINGS_FILE = ".compound-engineering/learnings.md"
 INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json")
 MAX_INPUT_HISTORY = 200
+SEARCH_CACHE_PATH = os.path.expanduser("~/.omlx/search_cache.db")
 
 # ── Proactive Context Management (U1) ────────────────────────────────────────
 # Per-layer prompt-token monitoring with a checkpoint trigger that fires before
@@ -49,6 +54,272 @@ MODEL_CONTEXT_LIMITS_FILE = os.path.expanduser("~/.omlx/model_context_limits.jso
 # to MODEL_CONTEXT_LIMITS_FILE). Keep this dict empty by default; populate as
 # real models are verified during U7 end-to-end testing.
 MODEL_CONTEXT_LIMITS: dict[str, int] = {}
+
+# ── Web Search Cache Layer ──────────────────────────────────────────────────
+# SQLite-based cache for web search results and fetched content.
+
+REALISTIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _init_search_cache() -> None:
+    """Create search cache database and tables if they don't exist."""
+    os.makedirs(os.path.dirname(SEARCH_CACHE_PATH), exist_ok=True)
+    conn = sqlite3.connect(SEARCH_CACHE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cached_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            search_query TEXT,
+            raw_html BLOB,
+            extracted_text TEXT,
+            title TEXT,
+            source_site TEXT,
+            fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME,
+            fetch_status INTEGER,
+            content_length INTEGER,
+            metadata JSON
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_url ON cached_results(url)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expires ON cached_results(expires_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_source_site ON cached_results(source_site)")
+    conn.commit()
+    conn.close()
+
+
+def _calculate_ttl_hours(url: str) -> int:
+    """Calculate TTL in hours based on URL patterns."""
+    url_lower = url.lower()
+    # API/Reference docs — 30 days = 720 hours
+    if any(p in url_lower for p in ["/docs/", "/api/", "developer.", "docs."]):
+        return 720
+    # News/Blogs — 24 hours
+    if any(p in url_lower for p in ["/blog/", "/news/", "/articles/"]):
+        return 24
+    # Default — 7 days = 168 hours
+    return 168
+
+
+def _get_cached_result(url: str) -> dict | None:
+    """Fetch cached entry by URL, returns None if not found or expired."""
+    conn = sqlite3.connect(SEARCH_CACHE_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM cached_results WHERE url = ?", (url,))
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    # Check if expired
+    if row["expires_at"]:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if datetime.now() > expires_at:
+            return None
+    return dict(row)
+
+
+def _cache_result(url: str, search_query: str, extracted_text: str, title: str,
+                  source_site: str, raw_html: bytes = None, metadata: dict = None) -> None:
+    """Store search/fetch result in cache with TTL."""
+    ttl_hours = _calculate_ttl_hours(url)
+    expires_at = datetime.now() + timedelta(hours=ttl_hours)
+    conn = sqlite3.connect(SEARCH_CACHE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO cached_results 
+            (url, search_query, raw_html, extracted_text, title, source_site, expires_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (url, search_query, raw_html, extracted_text, title, source_site,
+              expires_at.isoformat(), json.dumps(metadata) if metadata else None))
+    except sqlite3.IntegrityError:
+        # URL already exists, update it
+        cursor.execute("""
+            UPDATE cached_results SET
+                search_query = ?, raw_html = ?, extracted_text = ?, title = ?,
+                source_site = ?, fetched_at = CURRENT_TIMESTAMP, expires_at = ?, metadata = ?
+            WHERE url = ?
+        """, (search_query, raw_html, extracted_text, title, source_site,
+              expires_at.isoformat(), json.dumps(metadata) if metadata else None, url))
+    conn.commit()
+    conn.close()
+
+
+def _search_cache_db(query: str) -> list[dict]:
+    """Search cached entries by query string (matches URL, title, search_query, extracted_text)."""
+    search_pattern = f"%{query}%"
+    conn = sqlite3.connect(SEARCH_CACHE_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *, (julianday('now') - julianday(fetched_at)) as days_old
+        FROM cached_results
+        WHERE (url LIKE ? OR title LIKE ? OR search_query LIKE ? OR extracted_text LIKE ?)
+        AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+        ORDER BY days_old ASC
+        LIMIT 20
+    """, (search_pattern, search_pattern, search_pattern, search_pattern))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def _prune_expired_cache_entries() -> int:
+    """Delete expired cache entries. Returns count of deleted entries."""
+    conn = sqlite3.connect(SEARCH_CACHE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM cached_results
+        WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')
+    """)
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# ── Web Search & Fetch Functions ─────────────────────────────────────────────
+
+
+def _duckduckgo_search(query: str, max_results: int = 5) -> list[dict]:
+    """Search the web using Wikipedia's MediaWiki API as a fallback.
+    
+    Note: Direct web search scraping is unreliable due to anti-bot measures.
+    Wikipedia provides good reference/documentation coverage through its
+    stable API. For broader web search, users may need to provide their own
+    search via browser or configure a search API key.
+    """
+    return _wikipedia_search(query, max_results)
+
+
+def _wikipedia_search(query: str, max_results: int = 5) -> list[dict]:
+    """Search Wikipedia via MediaWiki API. Provides reference/doc coverage.
+    
+    Uses the query/search action which returns search results with snippets.
+    More reliable than OpenSearch for getting relevant results with descriptions.
+    """
+    from html import unescape
+    
+    params = {
+        'action': 'query',
+        'list': 'search',
+        'srsearch': query,
+        'srlimit': max_results,
+        'format': 'json'
+    }
+    
+    url = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(params)
+    headers = {'User-Agent': REALISTIC_USER_AGENT, 'Accept': 'application/json'}
+    
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except urllib.error.URLError as e:
+        return [{'error': f'Wikipedia search failed: {e}'}]
+    except json.JSONDecodeError:
+        return [{'error': 'Wikipedia returned invalid JSON'}]
+    
+    raw_results = data.get('query', {}).get('search', [])
+    results = []
+    
+    for r in raw_results[:max_results]:
+        title = r.get('title', '')
+        snippet = r.get('snippet', '')
+        url_val = f'https://en.wikipedia.org/wiki/{title.replace(" ", "_")}'
+        
+        # Clean up HTML in snippet
+        snippet = unescape(snippet)
+        snippet = re.sub(r'<[^>]+>', '', snippet)  # Remove HTML tags
+        snippet = ' '.join(snippet.split())
+        
+        results.append({
+            'title': f'{title} (Wikipedia)',
+            'url': url_val,
+            'snippet': snippet
+        })
+    
+    return results
+
+
+def _fetch_and_extract(url: str, max_retries: int = 2) -> dict:
+    """Fetch URL and extract article/documentation text.
+    
+    Returns dict with: title, text, word_count, source_site, error (if any)
+    """
+    # Validate URL scheme — only allow http and https
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return {"title": "", "text": "", "word_count": 0, "source_site": "",
+                "error": f"Invalid URL scheme '{parsed.scheme}'. Only http:// and https:// are allowed."}
+    
+    source_site = parsed.netloc
+    headers = {"User-Agent": REALISTIC_USER_AGENT}
+    
+    last_error = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            # Exponential backoff: 1s, 2s, 4s...
+            import time
+            time.sleep(min(2 ** (attempt - 1), 4))
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html = response.read().decode("utf-8", errors="replace")
+            break  # Success
+        except urllib.error.URLError as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
+    else:
+        # All retries exhausted
+        return {"title": "", "text": "", "word_count": 0, "source_site": source_site,
+                "error": f"Failed to fetch after {max_retries + 1} attempts: {last_error}"}
+    
+    # Try readability-lxml first
+    try:
+        from readability import Document
+        doc = Document(html)
+        title = doc.title() or ""
+        content_html = doc.summary()
+    except Exception:
+        # Fallback to BeautifulSoup
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "lxml")
+            title = soup.title.string.strip() if soup.title else ""
+            # Remove script/style tags
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            content_html = str(soup.body) if soup.body else str(soup)
+        except Exception as e:
+            return {"title": "", "text": "", "word_count": 0, "source_site": source_site,
+                    "error": f"Parse error: {e}"}
+    
+    # Extract plain text from HTML
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(content_html, "lxml")
+        text = soup.get_text(separator="\n", strip=True)
+        # Clean up excessive whitespace
+        text = re.sub(r"\n{3,}", "\n\n", text)
+    except Exception:
+        text = content_html
+    
+    word_count = len(text.split()) if text else 0
+    
+    return {
+        "title": title.strip() if title else "",
+        "text": text,
+        "word_count": word_count,
+        "source_site": source_site,
+        "error": None
+    }
 
 
 def _load_model_context_overrides() -> None:
@@ -2091,6 +2362,52 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web using DuckDuckGo. Returns search results with snippets. Use depth='deep' to fetch full content from top results. Use cache_only=True to search only cached results without network access.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query string"},
+                    "depth": {"type": "string", "enum": ["basic", "deep"], "default": "basic", "description": "'basic' returns snippets only, 'deep' fetches full content"},
+                    "cache_only": {"type": "boolean", "default": False, "description": "If true, only search cache without network access"},
+                    "max_results": {"type": "integer", "default": 5, "description": "Maximum results to return"}
+                },
+                "required": ["query"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch and extract text content from a specific URL. Returns cleaned article/documentation text with metadata. Automatically caches results for later retrieval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch"},
+                    "use_cache": {"type": "boolean", "default": True, "description": "If true, return cached content if available"}
+                },
+                "required": ["url"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_cache",
+            "description": "Search cached web content without making network requests. Returns previously fetched pages matching the query. Useful for recalling information from earlier in the session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query (matches URL, title, and content)"}
+                },
+                "required": ["query"]
+            },
+        },
+    },
 ]
 
 WORK_DIR = os.getcwd()
@@ -2481,23 +2798,37 @@ _COMPLETION_VERIFY_PROMPT = (
     "Workflow artifacts:\n{artifacts}\n\n"
     "Manager's proposed final summary:\n{final_message}\n\n"
     "DEFAULT TO 'complete' UNLESS THERE IS CLEAR EVIDENCE THE WORK WAS NOT DONE.\n"
-    "Only reply 'incomplete' when one of these is true:\n"
-    "  - The objective explicitly required code changes but the work phase never ran\n"
+    "\n"
+    "When replying 'incomplete', you MUST:\n"
+    "1. Quote the EXACT text from the final_message that proves incompleteness\n"
+    "2. Identify which violation type applies\n"
+    "3. If you cannot quote specific evidence, reply 'complete'\n"
+    "\n"
+    "Reply 'incomplete' ONLY when one of these is true:\n"
+    "  - work_not_run: The objective explicitly required code changes but the work "
+    "phase never ran\n"
     "    (work is NOT in the completed phases list).\n"
-    "  - The final summary itself admits the task is unfinished, blocked, or only\n"
+    "  - admission_incomplete: The final summary itself admits the task is "
+    "unfinished, blocked, or only\n"
     "    partially done.\n"
-    "  - The summary describes only planning/discussion when the user asked for a\n"
+    "  - discussion_only: The summary describes only planning/discussion when the "
+    "user asked for a\n"
     "    real change.\n\n"
     "Do NOT reply 'incomplete' just because:\n"
     "  - You cannot personally see test results or run the code.\n"
     "  - You think more polishing, review, or extra phases would be nice.\n"
     "  - The summary is brief.\n"
     "  - You did not personally inspect the diff.\n"
+    "  - You are simply uncertain — uncertainty defaults to 'complete'.\n"
     "If work has run and the summary claims the fix or feature is done, trust it.\n\n"
+    "CRITICAL: If you cannot identify specific evidence matching one of the\n"
+    "three violation types above, reply 'complete'.\n\n"
     "Reply with JSON only using this schema:\n"
     "{{\n"
     '  "verdict": "complete" | "incomplete",\n'
     '  "missing": "what is still missing if incomplete, else empty string",\n'
+    '  "evidence_quote": "exact text from final_message proving incompleteness, else empty",\n'
+    '  "violation_type": "none | work_not_run | admission_incomplete | discussion_only",\n'
     '  "next_phase": "brainstorm|plan|deepen_plan|work|review|compound or empty",\n'
     '  "next_phase_input": "instruction for the next phase, or empty"\n'
     "}}"
@@ -2518,13 +2849,55 @@ def _parse_completion_verdict(text: str) -> dict | None:
     return {
         "verdict": verdict,
         "missing": (data.get("missing") or "").strip(),
+        "evidence_quote": (data.get("evidence_quote") or "").strip(),
+        "violation_type": (data.get("violation_type") or "none").strip(),
         "next_phase": (data.get("next_phase") or "").strip(),
         "next_phase_input": (data.get("next_phase_input") or "").strip(),
     }
 
 
+def _validate_evidence(verdict_data: dict, final_message: str) -> dict | None:
+    """Validate that 'incomplete' verdicts have proper evidence.
+    
+    Returns the verdict_data if valid, or a modified version with verdict='complete'
+    if evidence is missing/invalid.
+    """
+    if verdict_data.get("verdict") != "incomplete":
+        return verdict_data
+    
+    evidence = verdict_data.get("evidence_quote", "").strip()
+    
+    # If no evidence provided, default to complete
+    if not evidence:
+        verdict_data["verdict"] = "complete"
+        verdict_data["missing"] = ""
+        verdict_data["next_phase"] = ""
+        return verdict_data
+    
+    # If evidence doesn't appear in final_message, default to complete
+    if evidence not in final_message:
+        verdict_data["verdict"] = "complete"
+        verdict_data["missing"] = ""
+        verdict_data["next_phase"] = ""
+        return verdict_data
+    
+    # If violation_type is not recognized, default to complete
+    valid_violations = {"work_not_run", "admission_incomplete", "discussion_only"}
+    if verdict_data.get("violation_type") not in valid_violations:
+        verdict_data["verdict"] = "complete"
+        verdict_data["missing"] = ""
+        verdict_data["next_phase"] = ""
+        return verdict_data
+    
+    return verdict_data
+
+
 def run_completion_verifier(workflow_state: CEWorkflowState, final_message: str, model: str) -> dict | None:
-    """Ask the manager model to confirm the work matches the original objective."""
+    """Ask the manager model to confirm the work matches the original objective.
+    
+    Single-pass verification: one API call, no retries. If parsing fails,
+    returns None (which upstream treats as 'skip verification, allow completion').
+    """
     artifacts = _format_workflow_artifacts()
     completed = ", ".join(workflow_state.completed_phases) or "none"
     prompt = _COMPLETION_VERIFY_PROMPT.format(
@@ -2534,24 +2907,24 @@ def run_completion_verifier(workflow_state: CEWorkflowState, final_message: str,
         final_message=final_message or "(no final message)",
     )
     messages = [
-        {"role": "system", "content": "You are a strict completion auditor. Output JSON only."},
+        {"role": "system", "content": "You are a completion verifier. Default to 'complete' unless there is clear evidence of incompleteness. Output JSON only."},
         {"role": "user", "content": prompt},
     ]
-    for _ in range(3):
-        response = api_call(messages, model)
-        if not response:
-            return None
-        parsed = normalize_api_response(response)
-        text = parsed.get("text") or ""
-        verdict = _parse_completion_verdict(text)
-        if verdict:
-            return verdict
-        messages.append({"role": "assistant", "content": text})
-        messages.append({
-            "role": "user",
-            "content": "Reply with valid JSON only using the required schema.",
-        })
-    return None
+    
+    # Single API call — no retry loop
+    response = api_call(messages, model)
+    if not response:
+        return None
+    parsed = normalize_api_response(response)
+    text = parsed.get("text") or ""
+    verdict = _parse_completion_verdict(text)
+    
+    # Validate evidence if verdict is incomplete
+    if verdict:
+        verdict = _validate_evidence(verdict, final_message)
+    
+    # Return verdict if valid, else None (skip verification)
+    return verdict
 
 
 # Manager JSON uses underscores for multi-word phases (doc_review,
@@ -3225,6 +3598,14 @@ TOOL_DISPATCH = {
         args.get("context_id", "current"),
         args.get("limit", 5),
     ),
+    "web_search": lambda args: tool_web_search(
+        args["query"],
+        args.get("depth", "basic"),
+        args.get("cache_only", False),
+        args.get("max_results", 5),
+    ),
+    "fetch_url": lambda args: tool_fetch_url(args["url"], args.get("use_cache", True)),
+    "search_cache": lambda args: tool_search_cache(args["query"]),
 }
 
 
@@ -4255,6 +4636,58 @@ def _is_retryable_empty_response(parsed: dict, messages: list | None = None) -> 
     return False
 
 
+_NARRATION_KEYWORDS = [
+    "let me", "i need to", "i'll ", "i will", "i should",
+    "next step", "now i", "let's ",
+    "add a ", "add the ", "you need to", "you should", "you can ",
+    "here is the", "here's the",
+    "insert the", "insert this", "add this", "place this",
+    "to implement", "to add", "would need to", "should be added",
+]
+
+_COMPLETION_REPORT_MARKERS = [
+    "already complete",
+    "already completed",
+    "already correct",
+    "already in the code",
+    "already in place",
+    "implementation is already complete",
+    "implementation is complete",
+    "the implementation is already complete",
+    "the implementation is complete",
+    "fix is already complete",
+    "fix is complete",
+    "work has been completed",
+    "requirements have been fulfilled",
+    "requirements are fulfilled",
+    "nothing left to change",
+    "nothing left to do",
+    "changes are already applied",
+    "all requirements have been fulfilled",
+    "all requirements have been satisfied",
+]
+
+
+def _looks_like_completion_report(text: str) -> bool:
+    """True when the model is reporting that the requested work is already done."""
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    if not any(marker in lowered for marker in _COMPLETION_REPORT_MARKERS):
+        return False
+    return not any(keyword in lowered for keyword in _NARRATION_KEYWORDS)
+
+
+def _should_auto_nudge_for_narration(text: str, active_ce_mode: str | None, round_num: int) -> bool:
+    """Return True when CE should force the model to act instead of narrate."""
+    if not active_ce_mode or round_num >= MAX_TOOL_ROUNDS - 1 or not text:
+        return False
+    if _looks_like_completion_report(text):
+        return False
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in _NARRATION_KEYWORDS)
+
+
 def _write_malformed_response_debug(response: dict) -> str:
     """Persist the last malformed payload at a deterministic path for inspection."""
     os.makedirs(os.path.dirname(MALFORMED_DEBUG_FILE), exist_ok=True)
@@ -4429,19 +4862,8 @@ def agent_turn(messages: list, model: str) -> str:
             return f"[Malformed API response: {detail}]"
 
         # Narration guard: if model is describing what to do instead of doing it, nudge it
-        _narration_keywords = [
-            "let me", "i need to", "i'll ", "i will", "i should",
-            "next step", "now i", "let's ",
-            "add a ", "add the ", "you need to", "you should", "you can ",
-            "here is the", "here's the", "the change", "the fix",
-            "insert the", "insert this", "add this", "place this",
-            "to implement", "to add", "would need to", "should be added",
-            "implementation", "result:", "**result**",
-        ]
         _active_ce = getattr(_tui_instance, 'active_ce_mode', None) if _tui_instance else False
-        if (_active_ce and round_num < MAX_TOOL_ROUNDS - 1
-                and text
-                and any(kw in text.lower() for kw in _narration_keywords)):
+        if _should_auto_nudge_for_narration(text, _active_ce, round_num):
             _p = tui_print if _tui_instance else print
             _ts = datetime.now().strftime("%H:%M:%S")
             _p(f"[{_ts}] [auto-nudge: model narrated instead of acting]", C_DIM if _tui_instance else 0)
@@ -4537,6 +4959,254 @@ def tool_ce_list_agents() -> str:
         if len(desc) > 140:
             desc = desc[:137] + "..."
         lines.append(f"  {name}: {desc}" if desc else f"  {name}")
+    return "\n".join(lines)
+
+
+# ── Web Research Tools ───────────────────────────────────────────────────────
+
+
+def tool_web_search(query: str, depth: str = "basic", cache_only: bool = False, max_results: int = 5) -> str:
+    """Search the web using DuckDuckGo.
+    
+    Args:
+        query: Search query string
+        depth: "basic" for snippets only, "deep" to fetch full content
+        cache_only: If True, only search cache (no network)
+        max_results: Maximum results to return
+    
+    Returns formatted search results with numbered sources.
+    """
+    from datetime import datetime as dt
+    lines = []
+    fetched_count = 0
+    cached_count = 0
+    start_time = time.time()
+    
+    if cache_only:
+        # Search cache only
+        cached = _search_cache_db(query)
+        if not cached:
+            return f"No cached results for: {query}"
+        lines.append(f"Cached Results for: {query}")
+        for i, entry in enumerate(cached[:max_results], 1):
+            title = entry.get("title", "Unknown")
+            url = entry.get("url", "")
+            fetched_at = entry.get("fetched_at", "")
+            days_old = entry.get("days_old", 0)
+            age_str = f"{int(days_old)} days ago" if days_old else "recent"
+            snippet = (entry.get("extracted_text", "")[:200] + "...") if entry.get("extracted_text") else ""
+            lines.append(f"")
+            lines.append(f"[{i}] {title}")
+            lines.append(f"    {url}")
+            lines.append(f"    [CACHED: {age_str}]")
+            if snippet:
+                lines.append(f"    {snippet}")
+        elapsed = time.time() - start_time
+        lines.append(f"")
+        lines.append(f"---")
+        lines.append(f"Sources: {len(cached)} cached results ({elapsed:.1f}s)")
+        return "\n".join(lines)
+    
+    # Fetch from DuckDuckGo
+    results = _duckduckgo_search(query, max_results)
+    
+    # Check for errors
+    if results and results[0].get("error"):
+        return f"Search error: {results[0]['error']}\nTry: web_search('{query}', cache_only=True)"
+    
+    if not results:
+        return f"No results found for: {query}"
+    
+    lines.append(f"Search Results for: {query}")
+    
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "Unknown")
+        url = r.get("url", "")
+        snippet = r.get("snippet", "")
+        
+        lines.append(f"")
+        lines.append(f"[{i}] {title}")
+        if url:
+            lines.append(f"    {url}")
+        
+        # Check cache first
+        cached = _get_cached_result(url)
+        if cached:
+            cached_count += 1
+            fetched_at = cached.get("fetched_at", "")
+            if fetched_at:
+                try:
+                    fetched_dt = dt.fromisoformat(fetched_at)
+                    days_old = (dt.now() - fetched_dt).days
+                    age_str = f"{days_old} days ago" if days_old > 0 else "today"
+                except:
+                    age_str = "cached"
+            else:
+                age_str = "cached"
+            lines.append(f"    [CACHED: {age_str}]")
+            # Use cached content for deep search
+            if depth == "deep":
+                cached_text = cached.get("extracted_text", "")[:500]
+                if cached_text:
+                    lines.append(f"    Content preview: {cached_text}...")
+        else:
+            # Fetch fresh for deep search
+            if depth == "deep":
+                fetch_result = _fetch_and_extract(url)
+                if fetch_result.get("error"):
+                    lines.append(f"    [FETCH ERROR: {fetch_result['error']}]")
+                else:
+                    fetched_count += 1
+                    # Cache the result
+                    _cache_result(
+                        url=url,
+                        search_query=query,
+                        extracted_text=fetch_result["text"],
+                        title=fetch_result["title"],
+                        source_site=fetch_result["source_site"]
+                    )
+                    content_preview = fetch_result["text"][:500]
+                    lines.append(f"    [FRESH]")
+                    if content_preview:
+                        lines.append(f"    Content preview: {content_preview}...")
+                    # Politeness delay
+                    if i < max_results:
+                        time.sleep(0.5)
+        
+        # Show snippet if available and not showing full content
+        if snippet and depth == "basic":
+            # Clean up snippet
+            clean_snippet = " ".join(snippet.split())
+            if len(clean_snippet) > 300:
+                clean_snippet = clean_snippet[:297] + "..."
+            lines.append(f"    {clean_snippet}")
+    
+    elapsed = time.time() - start_time
+    lines.append(f"")
+    lines.append(f"---")
+    status_parts = [f"{len(results)} results"]
+    if cached_count:
+        status_parts.append(f"{cached_count} cached")
+    if fetched_count:
+        status_parts.append(f"{fetched_count} fetched")
+    status_parts.append(f"({elapsed:.1f}s)")
+    lines.append(f"Sources: {', '.join(status_parts)}")
+    
+    return "\n".join(lines)
+
+
+def tool_fetch_url(url: str, use_cache: bool = True) -> str:
+    """Fetch and extract text content from a URL.
+    
+    Args:
+        url: URL to fetch
+        use_cache: If True, return cached content if available
+    
+    Returns extracted text with metadata.
+    """
+    lines = []
+    
+    # Check cache first
+    if use_cache:
+        cached = _get_cached_result(url)
+        if cached:
+            title = cached.get("title", "Unknown")
+            text = cached.get("extracted_text", "")
+            source_site = cached.get("source_site", "")
+            fetched_at = cached.get("fetched_at", "")
+            from datetime import datetime as dt
+            if fetched_at:
+                try:
+                    fetched_dt = dt.fromisoformat(fetched_at)
+                    days_old = (dt.now() - fetched_dt).days
+                    age_str = f"{days_old} days ago" if days_old > 0 else "today"
+                except:
+                    age_str = "cached"
+            else:
+                age_str = "cached"
+            lines.append(f"Content from: {url}")
+            lines.append(f"Title: {title}")
+            lines.append(f"Source: {source_site}")
+            lines.append(f"[CACHED: {age_str}]")
+            lines.append(f"")
+            lines.append(text[:4000])  # Limit output
+            if len(text) > 4000:
+                lines.append(f"...")
+                lines.append(f"(truncated at 4000 chars, total: {len(text)} chars)")
+            return "\n".join(lines)
+    
+    # Fetch fresh
+    fetch_result = _fetch_and_extract(url)
+    
+    if fetch_result.get("error"):
+        return f"Failed to fetch {url}: {fetch_result['error']}"
+    
+    title = fetch_result["title"] or "Unknown"
+    text = fetch_result["text"]
+    word_count = fetch_result["word_count"]
+    source_site = fetch_result["source_site"]
+    
+    # Cache the result
+    _cache_result(
+        url=url,
+        search_query=None,
+        extracted_text=text,
+        title=title,
+        source_site=source_site
+    )
+    
+    lines.append(f"Content from: {url}")
+    lines.append(f"Title: {title}")
+    lines.append(f"Source: {source_site}")
+    lines.append(f"Word count: {word_count}")
+    lines.append(f"[FRESH]")
+    lines.append(f"")
+    lines.append(text[:4000])
+    if len(text) > 4000:
+        lines.append(f"...")
+        lines.append(f"(truncated at 4000 chars, total: {len(text)} chars)")
+    
+    return "\n".join(lines)
+
+
+def tool_search_cache(query: str) -> str:
+    """Search cached web content without network requests.
+    
+    Args:
+        query: Search query (matches URL, title, search_query, extracted_text)
+    
+    Returns list of cached entries matching the query.
+    """
+    cached = _search_cache_db(query)
+    
+    if not cached:
+        return f"No cached results for: {query}"
+    
+    lines = [f"Cached Results for: {query}"]
+    
+    for entry in cached:
+        title = entry.get("title", "Unknown")
+        url = entry.get("url", "")
+        source_site = entry.get("source_site", "")
+        days_old = entry.get("days_old", 0)
+        search_query = entry.get("search_query", "")
+        word_count = len(entry.get("extracted_text", "").split()) if entry.get("extracted_text") else 0
+        
+        age_str = f"{int(days_old)} days ago" if days_old else "recent"
+        
+        lines.append(f"")
+        lines.append(f"Title: {title}")
+        lines.append(f"URL: {url}")
+        lines.append(f"Source: {source_site}")
+        lines.append(f"Cached: {age_str}")
+        lines.append(f"Word count: {word_count}")
+        if search_query:
+            lines.append(f"Original query: {search_query}")
+    
+    lines.append(f"")
+    lines.append(f"---")
+    lines.append(f"Total: {len(cached)} cached entries")
+    
     return "\n".join(lines)
 
 
@@ -6664,18 +7334,7 @@ class AgentTUI:
                     return f"[Malformed API response: {detail}]"
 
                 # Final text response -- but check if the model is narrating instead of acting
-                _narration_keywords = [
-                    "let me", "i need to", "i'll ", "i will", "i should",
-                    "next step", "now i", "let's ",
-                    "add a ", "add the ", "you need to", "you should", "you can ",
-                    "here is the", "here's the", "the change", "the fix",
-                    "insert the", "insert this", "add this", "place this",
-                    "to implement", "to add", "would need to", "should be added",
-                    "implementation", "result:", "**result**",
-                ]
-                if (self.active_ce_mode and round_num < MAX_TOOL_ROUNDS - 1
-                        and text
-                        and any(kw in text.lower() for kw in _narration_keywords)):
+                if _should_auto_nudge_for_narration(text, self.active_ce_mode, round_num):
                     _ts = datetime.now().strftime("%H:%M:%S")
                     tui_print(f"[{_ts}] [auto-nudge: model narrated instead of acting]", C_DIM)
                     self.messages.append({"role": "assistant", "content": text})
@@ -6853,31 +7512,95 @@ Navigation:
   Ctrl+L              Clear output"""
 
 
+def _extract_explicit_model_memory_gb(model_name: str) -> float | None:
+    """Return the largest explicit GB footprint embedded in a model name."""
+    matches = [
+        float(match.group(1))
+        for match in re.finditer(r"(\d+(?:\.\d+)?)\s*g(?:i)?b\b", model_name, re.IGNORECASE)
+    ]
+    if not matches:
+        return None
+    return max(matches)
+
+
+def _format_model_memory_gb(mem_gb: float) -> str:
+    if float(mem_gb).is_integer():
+        return f"{int(mem_gb)}GB"
+    return f"{mem_gb:g}GB"
+
+
+_model_size_cache: dict[str, float] | None = None
+
+
+def _fetch_model_sizes() -> dict[str, float]:
+    """Query oMLX admin API for estimated in-memory sizes of all models. Returns {model_id: gb}."""
+    global _model_size_cache
+    if _model_size_cache is not None:
+        return _model_size_cache
+    cookie = _omlx_admin_login()
+    if not cookie:
+        _model_size_cache = {}
+        return _model_size_cache
+    try:
+        req = urllib.request.Request(
+            f"{API_URL.replace('/v1', '')}/admin/api/models",
+            headers={"Cookie": f"omlx_admin_session={cookie}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        _model_size_cache = {
+            m["id"]: m["estimated_size"] / (1024 ** 3)
+            for m in data.get("models", [])
+            if "estimated_size" in m
+        }
+    except Exception:
+        _model_size_cache = {}
+    return _model_size_cache
+
+
+def _get_model_estimated_size_gb(model_name: str) -> float | None:
+    """Return the oMLX estimated in-memory size for a model in GB, or None."""
+    sizes = _fetch_model_sizes()
+    return sizes.get(model_name)
+
+
 def _estimate_model_defaults(model_name: str, group_key: str) -> tuple:
     """Estimate intelligent defaults for concurrency and memory based on model name."""
-    name = model_name.lower()
-    # Detect quantization from model name
-    if "8bit" in name or "8-bit" in name:
-        weight_gb = 27  # 27B at 8-bit
-    elif "4bit" in name or "4-bit" in name:
-        weight_gb = 14  # 27B at 4-bit
-    elif "3bit" in name or "3-bit" in name:
-        weight_gb = 11
-    else:
-        weight_gb = 14  # assume 4-bit if unknown
+    estimated_gb = _get_model_estimated_size_gb(model_name)
 
-    # Memory: weights + headroom for KV cache + activations
-    # 48GB total, ~6GB OS, so ~42GB usable
-    mem_gb = min(weight_gb + 12, 40)
-    # Concurrency: thinking-like groups get 1, others depend on model size
+    if estimated_gb is not None:
+        effective_model_gb = estimated_gb
+        mem_gb = min(math.ceil(estimated_gb), 40)
+    else:
+        name = model_name.lower()
+        explicit_mem_gb = _extract_explicit_model_memory_gb(model_name)
+
+        # Detect quantization from model name
+        if "8bit" in name or "8-bit" in name:
+            weight_gb = 27  # 27B at 8-bit
+        elif "4bit" in name or "4-bit" in name:
+            weight_gb = 14  # 27B at 4-bit
+        elif "3bit" in name or "3-bit" in name:
+            weight_gb = 11
+        else:
+            weight_gb = 14  # assume 4-bit if unknown
+
+        if explicit_mem_gb is not None:
+            effective_model_gb = explicit_mem_gb
+            mem_gb = min(explicit_mem_gb, 40)
+        else:
+            effective_model_gb = weight_gb
+            mem_gb = min(weight_gb + 12, 40)
+
+    # Concurrency: thinking-like groups get 1, others depend on model size.
     if group_key in ("ideate_brainstorm", "plan"):
         conc = 1  # thinking = single focused request
-    elif weight_gb >= 20:
+    elif effective_model_gb >= 20:
         conc = 1  # large model, keep it simple
     else:
         conc = 2  # small model can handle 2
 
-    return conc, f"{mem_gb}GB"
+    return conc, _format_model_memory_gb(mem_gb)
 
 
 def _select_models_for_groups(models: list) -> dict:
@@ -6996,6 +7719,15 @@ def main():
                 "role": "system",
                 "content": f"[Project learnings loaded from {LEARNINGS_FILE}:]\n{content[:3000]}",
             })
+
+    # Initialize search cache and prune expired entries
+    try:
+        _init_search_cache()
+        pruned = _prune_expired_cache_entries()
+        if pruned > 0:
+            pass  # Could log: f"Pruned {pruned} expired cache entries"
+    except Exception as e:
+        pass  # Cache init failure shouldn't crash startup
 
     if args.no_tui:
         # Fallback to the old plain-text interface

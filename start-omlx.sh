@@ -14,7 +14,7 @@
 exec /Users/jlacomba/omlx-venv/bin/omlx serve \
     --model-dir /Users/jlacomba/models \
     --api-key omlx-80ktncu2cdui9fal \
-    --max-model-memory 32GB \
+    --max-model-memory 40GB \
     --max-process-memory 85% \
     --hot-cache-max-size 8GB \
     --initial-cache-blocks 64 \
