@@ -127,7 +127,8 @@ def _cache_result(url: str, search_query: str, extracted_text: str, title: str,
                   source_site: str, raw_html: bytes = None, metadata: dict = None) -> None:
     """Store search/fetch result in cache with TTL."""
     ttl_hours = _calculate_ttl_hours(url)
-    expires_at = datetime.now() + timedelta(hours=ttl_hours)
+    # Store UTC timestamp as ISO string without timezone for consistent SQLite comparison
+    expires_at = (datetime.now() + timedelta(hours=ttl_hours)).isoformat()
     conn = sqlite3.connect(SEARCH_CACHE_PATH)
     cursor = conn.cursor()
     try:
@@ -136,7 +137,7 @@ def _cache_result(url: str, search_query: str, extracted_text: str, title: str,
             (url, search_query, raw_html, extracted_text, title, source_site, expires_at, metadata)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (url, search_query, raw_html, extracted_text, title, source_site,
-              expires_at.isoformat(), json.dumps(metadata) if metadata else None))
+              expires_at, json.dumps(metadata) if metadata else None))
     except sqlite3.IntegrityError:
         # URL already exists, update it
         cursor.execute("""
@@ -145,7 +146,7 @@ def _cache_result(url: str, search_query: str, extracted_text: str, title: str,
                 source_site = ?, fetched_at = CURRENT_TIMESTAMP, expires_at = ?, metadata = ?
             WHERE url = ?
         """, (search_query, raw_html, extracted_text, title, source_site,
-              expires_at.isoformat(), json.dumps(metadata) if metadata else None, url))
+              expires_at, json.dumps(metadata) if metadata else None, url))
     conn.commit()
     conn.close()
 
@@ -156,11 +157,12 @@ def _search_cache_db(query: str) -> list[dict]:
     conn = sqlite3.connect(SEARCH_CACHE_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    # Use strftime for consistent timestamp comparison (handles ISO strings without TZ)
     cursor.execute("""
         SELECT *, (julianday('now') - julianday(fetched_at)) as days_old
         FROM cached_results
         WHERE (url LIKE ? OR title LIKE ? OR search_query LIKE ? OR extracted_text LIKE ?)
-        AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+        AND (expires_at IS NULL OR strftime('%s', expires_at) > strftime('%s', 'now'))
         ORDER BY days_old ASC
         LIMIT 20
     """, (search_pattern, search_pattern, search_pattern, search_pattern))
@@ -247,17 +249,70 @@ def _wikipedia_search(query: str, max_results: int = 5) -> list[dict]:
     return results
 
 
+def _is_safe_url(url: str) -> tuple[bool, str]:
+    """Validate URL for safety.
+    
+    Returns (is_safe, error_message). Checks:
+    - Only http/https schemes allowed
+    - No private/internal IP addresses
+    - No IPv6 loopback or link-local
+    """
+    import ipaddress
+    import socket
+    
+    parsed = urllib.parse.urlparse(url)
+    
+    # Check scheme
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Invalid URL scheme '{parsed.scheme}'. Only http:// and https:// are allowed."
+    
+    host = parsed.hostname
+    if not host:
+        return False, "Invalid URL: no hostname"
+    
+    # Resolve hostname to check for IP-based attacks
+    try:
+        # Get all addresses (handles CNAME chains)
+        addr_info = socket.getaddrinfo(host, None)
+        for family, socktype, proto, canonname, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                
+                # Block private/internal ranges
+                if ip.is_private:
+                    return False, f"Access to private IP address {ip_str} is not allowed"
+                if ip.is_loopback:
+                    return False, f"Access to loopback address {ip_str} is not allowed"
+                if ip.is_link_local:
+                    return False, f"Access to link-local address {ip_str} is not allowed"
+                if ip.is_reserved:
+                    return False, f"Access to reserved address {ip_str} is not allowed"
+            except ValueError:
+                # Not a valid IP, skip
+                continue
+    except socket.gaierror:
+        # Can't resolve hostname - allow it, let the fetch fail naturally
+        pass
+    except OSError:
+        # Socket errors - allow it
+        pass
+    
+    return True, ""
+
+
 def _fetch_and_extract(url: str, max_retries: int = 2) -> dict:
     """Fetch URL and extract article/documentation text.
     
     Returns dict with: title, text, word_count, source_site, error (if any)
     """
-    # Validate URL scheme — only allow http and https
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    # Validate URL for safety
+    is_safe, error_msg = _is_safe_url(url)
+    if not is_safe:
         return {"title": "", "text": "", "word_count": 0, "source_site": "",
-                "error": f"Invalid URL scheme '{parsed.scheme}'. Only http:// and https:// are allowed."}
+                "error": error_msg}
     
+    parsed = urllib.parse.urlparse(url)
     source_site = parsed.netloc
     headers = {"User-Agent": REALISTIC_USER_AGENT}
     
