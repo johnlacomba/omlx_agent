@@ -422,6 +422,91 @@ def _rag_tokenize(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z][a-zA-Z0-9_-]*", text.lower())
 
 
+# ── Hybrid RAG: ONNX Embedding Layer ─────────────────────────────────────────
+
+_ONNX_AVAILABLE = False
+try:
+    import onnxruntime  # type: ignore
+    from tokenizers import Tokenizer as HFTokenizer  # type: ignore
+    import numpy as np  # type: ignore
+    _ONNX_AVAILABLE = True
+except ImportError:
+    pass
+
+_ONNX_MODEL_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_qint8_arm64.onnx"
+_TOKENIZER_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+_embedding_session = None
+_embedding_tokenizer = None
+
+
+def _ensure_embedding_model() -> bool:
+    global _embedding_session, _embedding_tokenizer
+    if _embedding_session is not None and _embedding_tokenizer is not None:
+        return True
+    if not _ONNX_AVAILABLE:
+        return False
+    os.makedirs(EMBEDDING_CACHE_DIR, exist_ok=True)
+    model_path = os.path.join(EMBEDDING_CACHE_DIR, "model_qint8_arm64.onnx")
+    tokenizer_path = os.path.join(EMBEDDING_CACHE_DIR, "tokenizer.json")
+    try:
+        if not os.path.isfile(model_path):
+            req = urllib.request.Request(_ONNX_MODEL_URL, headers={"User-Agent": REALISTIC_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                with open(model_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+        if not os.path.isfile(tokenizer_path):
+            req = urllib.request.Request(_TOKENIZER_URL, headers={"User-Agent": REALISTIC_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                with open(tokenizer_path, "wb") as f:
+                    f.write(resp.read())
+        _embedding_session = onnxruntime.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
+        )
+        _embedding_tokenizer = HFTokenizer.from_file(tokenizer_path)
+        _embedding_tokenizer.enable_truncation(max_length=512)
+        _embedding_tokenizer.enable_padding(length=512)
+        return True
+    except Exception:
+        _embedding_session = None
+        _embedding_tokenizer = None
+        return False
+
+
+def _release_embedding_session() -> None:
+    global _embedding_session, _embedding_tokenizer
+    _embedding_session = None
+    _embedding_tokenizer = None
+
+
+def _make_embedding(text: str) -> list[float] | None:
+    if not _ensure_embedding_model():
+        return None
+    try:
+        encoded = _embedding_tokenizer.encode(text)
+        input_ids = np.array([encoded.ids], dtype=np.int64)
+        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
+        token_type_ids = np.zeros_like(input_ids)
+        outputs = _embedding_session.run(
+            None,
+            {"input_ids": input_ids, "attention_mask": attention_mask, "token_type_ids": token_type_ids},
+        )
+        hidden_states = outputs[0]
+        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
+        sum_embeddings = np.sum(hidden_states * mask_expanded, axis=1)
+        sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+        sentence_embedding = (sum_embeddings / sum_mask)[0]
+        norm = np.linalg.norm(sentence_embedding)
+        if norm > 0:
+            sentence_embedding = sentence_embedding / norm
+        return sentence_embedding.tolist()
+    except Exception:
+        return None
+
+
 # ── Proactive Context Management (U1) ────────────────────────────────────────
 # Per-layer prompt-token monitoring with a checkpoint trigger that fires before
 # the model's context window is exhausted. See
