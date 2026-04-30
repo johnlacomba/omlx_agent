@@ -39,141 +39,6 @@ MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json"
 MAX_INPUT_HISTORY = 200
 SEARCH_CACHE_PATH = os.path.expanduser("~/.omlx/search_cache.db")
 SOLUTIONS_DIR = "docs/solutions"
-RAG_MAX_SOLUTION_CHARS = 800
-RAG_TOP_N = 5
-
-# ── Manager RAG: Solution Retrieval ────────────────────────────────────────────
-
-
-def _parse_solution_frontmatter(filepath: str) -> dict:
-    try:
-        with open(filepath, "r") as f:
-            text = f.read()
-    except Exception:
-        return {}
-    if not text.startswith("---"):
-        return {"_body": text[:RAG_MAX_SOLUTION_CHARS], "_path": filepath}
-    end = text.find("---", 3)
-    if end == -1:
-        return {"_body": text[:RAG_MAX_SOLUTION_CHARS], "_path": filepath}
-    fm_block = text[3:end].strip()
-    body = text[end + 3:].strip()
-    meta = {"_body": body[:RAG_MAX_SOLUTION_CHARS], "_path": filepath}
-    for line in fm_block.splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            key = key.strip().lstrip("- ")
-            val = val.strip().strip('"').strip("'")
-            if key == "tags":
-                continue
-            if key and val:
-                meta[key] = val
-        elif line.strip().startswith("- "):
-            meta.setdefault("tags", []).append(line.strip().lstrip("- ").strip())
-    return meta
-
-
-def _build_solution_index() -> list[dict]:
-    index = []
-    solutions_path = os.path.join(WORK_DIR, SOLUTIONS_DIR)
-    if os.path.isdir(solutions_path):
-        for root, _dirs, files in os.walk(solutions_path):
-            for fname in sorted(files):
-                if not fname.endswith(".md"):
-                    continue
-                fpath = os.path.join(root, fname)
-                meta = _parse_solution_frontmatter(fpath)
-                if meta:
-                    rel = os.path.relpath(fpath, WORK_DIR)
-                    meta["_relpath"] = rel
-                    index.append(meta)
-
-    learnings_path = os.path.join(WORK_DIR, LEARNINGS_FILE)
-    if os.path.isfile(learnings_path):
-        try:
-            with open(learnings_path, "r") as f:
-                content = f.read()
-        except Exception:
-            content = ""
-        if content.strip():
-            entries = re.split(r"\n---\s*\n", content)
-            for entry in entries:
-                entry = entry.strip()
-                if not entry or entry.startswith("# "):
-                    continue
-                title_match = re.search(r"^##\s+(.+)", entry, re.MULTILINE)
-                tags_match = re.search(r"\*\*Tags:\*\*\s*(.+)", entry)
-                problem_match = re.search(r"\*\*Problem:\*\*\s*\n(.+)", entry)
-                solution_match = re.search(r"\*\*Solution:\*\*\s*\n(.+)", entry)
-                meta = {
-                    "_path": learnings_path,
-                    "_relpath": LEARNINGS_FILE,
-                    "_source": "learnings",
-                }
-                if title_match:
-                    meta["title"] = title_match.group(1).strip()
-                if tags_match:
-                    meta["tags"] = [t.strip() for t in tags_match.group(1).split(",")]
-                summary_parts = []
-                if problem_match:
-                    summary_parts.append(f"Problem: {problem_match.group(1).strip()}")
-                if solution_match:
-                    summary_parts.append(f"Solution: {solution_match.group(1).strip()}")
-                meta["_body"] = " | ".join(summary_parts) if summary_parts else entry[:RAG_MAX_SOLUTION_CHARS]
-                index.append(meta)
-    return index
-
-
-def _tokenize_for_matching(text: str) -> set[str]:
-    words = re.findall(r"[a-z][a-z0-9_-]{2,}", text.lower())
-    return set(words)
-
-
-def _score_solution(entry: dict, objective_tokens: set[str]) -> float:
-    searchable = " ".join([
-        entry.get("title", ""),
-        " ".join(entry.get("tags", [])),
-        entry.get("problem_type", ""),
-        entry.get("module", ""),
-        entry.get("category", ""),
-        entry.get("_body", ""),
-    ]).lower()
-    entry_tokens = _tokenize_for_matching(searchable)
-    if not entry_tokens or not objective_tokens:
-        return 0.0
-    overlap = objective_tokens & entry_tokens
-    return len(overlap) / max(len(objective_tokens), 1)
-
-
-def _retrieve_relevant_solutions(objective: str, top_n: int = RAG_TOP_N) -> list[dict]:
-    index = _build_solution_index()
-    if not index:
-        return []
-    obj_tokens = _tokenize_for_matching(objective)
-    if not obj_tokens:
-        return index[:top_n]
-    scored = [(entry, _score_solution(entry, obj_tokens)) for entry in index]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [entry for entry, score in scored[:top_n] if score > 0.0]
-
-
-def _format_rag_context(solutions: list[dict]) -> str:
-    if not solutions:
-        return ""
-    lines = ["[Retrieved prior solutions relevant to this objective]"]
-    for i, entry in enumerate(solutions, 1):
-        title = entry.get("title", os.path.basename(entry.get("_relpath", "unknown")))
-        tags = ", ".join(entry.get("tags", []))
-        source = entry.get("_relpath", "")
-        body = entry.get("_body", "").strip()
-        lines.append(f"\n### Solution {i}: {title}")
-        if tags:
-            lines.append(f"Tags: {tags}")
-        if source:
-            lines.append(f"Source: {source}")
-        if body:
-            lines.append(body)
-    return "\n".join(lines)
 
 
 # ── Hybrid RAG: Index, Chunking, and Persistence ─────────────────────────────
@@ -460,9 +325,124 @@ class HybridIndex:
             ))
         return results
 
+    def hybrid_retrieve(self, query: str, top_k: int = 5) -> list:
+        if not self._built or not self.chunks:
+            return []
+        bm25_results = self.bm25_retrieve(query, top_k=top_k * 2)
+        bm25_map = {r.chunk_id: r.bm25_score for r in bm25_results}
+        cosine_map: dict[str, float] = {}
+        if _ONNX_AVAILABLE:
+            query_emb = _make_embedding(query)
+            if query_emb is not None:
+                for chunk in self.chunks:
+                    emb = self.embeddings.get(chunk.chunk_id)
+                    if emb is not None:
+                        cosine_map[chunk.chunk_id] = sum(
+                            a * b for a, b in zip(query_emb, emb)
+                        )
+                if cosine_map:
+                    max_cos = max(cosine_map.values())
+                    min_cos = min(cosine_map.values())
+                    rng = max_cos - min_cos
+                    if rng > 0:
+                        cosine_map = {
+                            cid: (s - min_cos) / rng for cid, s in cosine_map.items()
+                        }
+                    else:
+                        cosine_map = {cid: 1.0 for cid in cosine_map}
+        all_cids = set(bm25_map.keys()) | set(cosine_map.keys())
+        if not all_cids:
+            return []
+        alpha = RAG_ALPHA
+        scored: dict[str, tuple[float, float, float]] = {}
+        for cid in all_cids:
+            bm25_s = bm25_map.get(cid, 0.0)
+            cos_s = cosine_map.get(cid, 0.0)
+            combined = alpha * bm25_s + (1 - alpha) * cos_s
+            scored[cid] = (combined, bm25_s, cos_s)
+        ranked = sorted(scored.items(), key=lambda x: x[1][0], reverse=True)[:top_k]
+        chunk_map = {c.chunk_id: c for c in self.chunks}
+        results = []
+        for cid, (combined, bm25_s, cos_s) in ranked:
+            chunk = chunk_map[cid]
+            results.append(RetrievedEntry(
+                path=chunk.path,
+                chunk_id=cid,
+                section_title=chunk.section_title,
+                score=combined,
+                bm25_score=bm25_s,
+                cosine_score=cos_s,
+                source_meta=chunk.source_meta,
+                text=chunk.text,
+            ))
+        return results
+
     @property
     def is_built(self) -> bool:
         return self._built
+
+
+CROSS_ENCODER_ENABLED = False
+
+_hybrid_index: HybridIndex | None = None
+
+
+def _get_hybrid_index() -> HybridIndex:
+    global _hybrid_index
+    if _hybrid_index is None or not _hybrid_index.is_built:
+        _hybrid_index = HybridIndex()
+        _hybrid_index.batch_build()
+        if _ONNX_AVAILABLE and _ensure_embedding_model():
+            for chunk in _hybrid_index.chunks:
+                cached = _get_cached_embeddings(
+                    chunk.path, os.path.getmtime(chunk.path) if os.path.exists(chunk.path) else 0.0
+                )
+                if cached and chunk.chunk_id in cached:
+                    _hybrid_index.embeddings[chunk.chunk_id] = cached[chunk.chunk_id]
+                else:
+                    emb = _make_embedding(chunk.text)
+                    if emb is not None:
+                        _hybrid_index.embeddings[chunk.chunk_id] = emb
+            for path in {c.path for c in _hybrid_index.chunks}:
+                if os.path.exists(path):
+                    mtime = os.path.getmtime(path)
+                    path_chunks = [c for c in _hybrid_index.chunks if c.path == path]
+                    path_embs = {
+                        c.chunk_id: _hybrid_index.embeddings[c.chunk_id]
+                        for c in path_chunks if c.chunk_id in _hybrid_index.embeddings
+                    }
+                    if path_embs:
+                        _store_cached_embeddings(path, mtime, path_chunks, path_embs)
+    return _hybrid_index
+
+
+def _retrieve_relevant_solutions(objective: str, top_n: int = 5) -> list:
+    try:
+        idx = _get_hybrid_index()
+        return idx.hybrid_retrieve(objective, top_k=top_n)
+    except Exception:
+        return []
+
+
+def _format_rag_context(solutions: list) -> str:
+    if not solutions:
+        return ""
+    lines = ["[Retrieved prior solutions relevant to this objective]"]
+    for i, entry in enumerate(solutions, 1):
+        title = entry.section_title if hasattr(entry, "section_title") else str(entry)
+        path = entry.path if hasattr(entry, "path") else ""
+        score = entry.score if hasattr(entry, "score") else 0.0
+        bm25 = entry.bm25_score if hasattr(entry, "bm25_score") else 0.0
+        cosine = entry.cosine_score if hasattr(entry, "cosine_score") else 0.0
+        text = entry.text if hasattr(entry, "text") else ""
+        lines.append(f"\n### Solution {i}: {title}")
+        rel = os.path.relpath(path, WORK_DIR) if path else ""
+        if rel:
+            lines.append(f"Source: {rel}")
+        lines.append(f"Score: {score:.2f} (BM25: {bm25:.2f}, Cosine: {cosine:.2f})")
+        if text:
+            lines.append(text[:800])
+    return "\n".join(lines)
 
 
 def _rag_tokenize(text: str) -> list[str]:
@@ -3062,12 +3042,13 @@ Return JSON only with this schema:
 
 ## Prior solutions (RAG context)
 
-Before each decision, you may receive a "[Retrieved prior solutions]" block containing solutions from docs/solutions/ and .compound-engineering/learnings.md that are relevant to the current objective. Use these to:
+Before each decision, you may receive a "[Retrieved prior solutions]" block containing ranked results from docs/solutions/ and .compound-engineering/learnings.md. Each entry includes a confidence score (0.0–1.0) combining keyword (BM25) and semantic (cosine) similarity. Use these to:
 
-- **Skip phases already solved.** If a prior solution fully addresses the objective's approach, skip `brainstorm` and go straight to `plan` — reference the solution path in your phase_input so the planner can build on it.
+- **Skip phases already solved.** If a high-scoring solution (>0.7) fully addresses the objective, skip `brainstorm` and go straight to `plan` — reference the solution path in your phase_input.
 - **Inform phase_input.** When a retrieved solution contains gotchas, architectural decisions, or patterns relevant to the current phase, include the key insight in phase_input so the specialist phase benefits from it.
 - **Avoid repeating mistakes.** If a solution documents "What Didn't Work", make sure phase_input steers the specialist away from those approaches.
 - **Reference, don't duplicate.** Pass the solution file path (e.g. "See docs/solutions/logic-errors/foo.md") rather than copying the full content into phase_input.
+- **Interpret scores.** BM25 scores reflect keyword overlap; cosine scores reflect semantic similarity. A high cosine but low BM25 means the solution is conceptually related even if it uses different terminology.
 
 If no solutions are retrieved or none are relevant, proceed normally — the RAG context is advisory, not mandatory.
 """
