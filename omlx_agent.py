@@ -413,6 +413,53 @@ class HybridIndex:
         n = len(self.chunks)
         self._bm25_avg_dl = total_len / n if n else 1.0
 
+    def bm25_retrieve(self, query: str, top_k: int = 5) -> list:
+        if not self._built or not self.chunks:
+            return []
+        query_tokens = _rag_tokenize(query)
+        if not query_tokens:
+            return []
+        n = len(self.chunks)
+        scores: dict[str, float] = {}
+        k1, b = 1.5, 0.75
+        for chunk in self.chunks:
+            cid = chunk.chunk_id
+            tf = self._bm25_term_freqs.get(cid, {})
+            dl = self._bm25_doc_lens.get(cid, 0)
+            score = 0.0
+            for term in query_tokens:
+                df = self._bm25_doc_freqs.get(term, 0)
+                if df == 0:
+                    continue
+                idf = math.log((n - df + 0.5) / (df + 0.5) + 1.0)
+                term_freq = tf.get(term, 0)
+                numerator = term_freq * (k1 + 1)
+                denominator = term_freq + k1 * (1 - b + b * dl / self._bm25_avg_dl)
+                score += idf * numerator / denominator
+            if score > 0:
+                scores[cid] = score
+        if not scores:
+            return []
+        max_score = max(scores.values())
+        if max_score > 0:
+            scores = {cid: s / max_score for cid, s in scores.items()}
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        chunk_map = {c.chunk_id: c for c in self.chunks}
+        results = []
+        for cid, score in ranked:
+            chunk = chunk_map[cid]
+            results.append(RetrievedEntry(
+                path=chunk.path,
+                chunk_id=cid,
+                section_title=chunk.section_title,
+                score=score,
+                bm25_score=score,
+                cosine_score=0.0,
+                source_meta=chunk.source_meta,
+                text=chunk.text,
+            ))
+        return results
+
     @property
     def is_built(self) -> bool:
         return self._built
