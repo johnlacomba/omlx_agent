@@ -504,9 +504,10 @@ def _ensure_embedding_model() -> bool:
 
 
 def _release_embedding_session() -> None:
-    global _embedding_session, _embedding_tokenizer
+    global _embedding_session, _embedding_tokenizer, _hybrid_index
     _embedding_session = None
     _embedding_tokenizer = None
+    _hybrid_index = None
 
 
 def _make_embedding(text: str) -> list[float] | None:
@@ -6085,6 +6086,7 @@ class AgentTUI:
             # Unload old model if it's different from the new one
             if self._current_model_name and self._current_model_name != new_model:
                 unload_omlx_model(self._current_model_name)
+                _release_embedding_session()
 
             # Apply new concurrency and memory settings
             settings = {"max_concurrent_requests": config.get("concurrency", 1)}
@@ -7535,7 +7537,9 @@ class AgentTUI:
         manager_model = self.model_groups["manager"]["model"]
         # Make sure the manager model is loaded for the verifier turn.
         if self._current_model_name != manager_model:
-            unload_omlx_model(self._current_model_name) if self._current_model_name else None
+            if self._current_model_name:
+                unload_omlx_model(self._current_model_name)
+            _release_embedding_session()
             self._current_group = None
             self._current_model_name = None
             saved_mode = self.active_ce_mode
@@ -7582,6 +7586,7 @@ class AgentTUI:
         target_model = self.model_groups[CE_MODE_TO_GROUP[actual_phase]]["model"]
         if self._current_model_name == manager_model and manager_model != target_model:
             unload_omlx_model(manager_model)
+            _release_embedding_session()
             self._current_group = None
             self._current_model_name = None
 
@@ -8347,6 +8352,7 @@ def _main_plain(model_config, messages, models):
         new_model = cfg["model"]
         if _current_model_name and _current_model_name != new_model:
             unload_omlx_model(_current_model_name)
+            _release_embedding_session()
             settings = {"max_concurrent_requests": cfg.get("concurrency", 1)}
             if cfg.get("memory"):
                 settings["max_model_memory"] = cfg["memory"]
@@ -8361,6 +8367,7 @@ def _main_plain(model_config, messages, models):
         target_model = model_config[CE_MODE_TO_GROUP[actual_phase]]["model"]
         if _current_model_name == manager_model and manager_model != target_model:
             unload_omlx_model(manager_model)
+            _release_embedding_session()
             _current_model_name = None
 
         start_idx = len(messages)
