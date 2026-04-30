@@ -38,6 +38,389 @@ INPUT_HISTORY_FILE = os.path.expanduser("~/.omlx/input_history.json")
 MALFORMED_DEBUG_FILE = os.path.expanduser("~/.omlx/last_malformed_response.json")
 MAX_INPUT_HISTORY = 200
 SEARCH_CACHE_PATH = os.path.expanduser("~/.omlx/search_cache.db")
+SOLUTIONS_DIR = "docs/solutions"
+RAG_MAX_SOLUTION_CHARS = 800
+RAG_TOP_N = 5
+
+# ── Manager RAG: Solution Retrieval ────────────────────────────────────────────
+
+
+def _parse_solution_frontmatter(filepath: str) -> dict:
+    try:
+        with open(filepath, "r") as f:
+            text = f.read()
+    except Exception:
+        return {}
+    if not text.startswith("---"):
+        return {"_body": text[:RAG_MAX_SOLUTION_CHARS], "_path": filepath}
+    end = text.find("---", 3)
+    if end == -1:
+        return {"_body": text[:RAG_MAX_SOLUTION_CHARS], "_path": filepath}
+    fm_block = text[3:end].strip()
+    body = text[end + 3:].strip()
+    meta = {"_body": body[:RAG_MAX_SOLUTION_CHARS], "_path": filepath}
+    for line in fm_block.splitlines():
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key = key.strip().lstrip("- ")
+            val = val.strip().strip('"').strip("'")
+            if key == "tags":
+                continue
+            if key and val:
+                meta[key] = val
+        elif line.strip().startswith("- "):
+            meta.setdefault("tags", []).append(line.strip().lstrip("- ").strip())
+    return meta
+
+
+def _build_solution_index() -> list[dict]:
+    index = []
+    solutions_path = os.path.join(WORK_DIR, SOLUTIONS_DIR)
+    if os.path.isdir(solutions_path):
+        for root, _dirs, files in os.walk(solutions_path):
+            for fname in sorted(files):
+                if not fname.endswith(".md"):
+                    continue
+                fpath = os.path.join(root, fname)
+                meta = _parse_solution_frontmatter(fpath)
+                if meta:
+                    rel = os.path.relpath(fpath, WORK_DIR)
+                    meta["_relpath"] = rel
+                    index.append(meta)
+
+    learnings_path = os.path.join(WORK_DIR, LEARNINGS_FILE)
+    if os.path.isfile(learnings_path):
+        try:
+            with open(learnings_path, "r") as f:
+                content = f.read()
+        except Exception:
+            content = ""
+        if content.strip():
+            entries = re.split(r"\n---\s*\n", content)
+            for entry in entries:
+                entry = entry.strip()
+                if not entry or entry.startswith("# "):
+                    continue
+                title_match = re.search(r"^##\s+(.+)", entry, re.MULTILINE)
+                tags_match = re.search(r"\*\*Tags:\*\*\s*(.+)", entry)
+                problem_match = re.search(r"\*\*Problem:\*\*\s*\n(.+)", entry)
+                solution_match = re.search(r"\*\*Solution:\*\*\s*\n(.+)", entry)
+                meta = {
+                    "_path": learnings_path,
+                    "_relpath": LEARNINGS_FILE,
+                    "_source": "learnings",
+                }
+                if title_match:
+                    meta["title"] = title_match.group(1).strip()
+                if tags_match:
+                    meta["tags"] = [t.strip() for t in tags_match.group(1).split(",")]
+                summary_parts = []
+                if problem_match:
+                    summary_parts.append(f"Problem: {problem_match.group(1).strip()}")
+                if solution_match:
+                    summary_parts.append(f"Solution: {solution_match.group(1).strip()}")
+                meta["_body"] = " | ".join(summary_parts) if summary_parts else entry[:RAG_MAX_SOLUTION_CHARS]
+                index.append(meta)
+    return index
+
+
+def _tokenize_for_matching(text: str) -> set[str]:
+    words = re.findall(r"[a-z][a-z0-9_-]{2,}", text.lower())
+    return set(words)
+
+
+def _score_solution(entry: dict, objective_tokens: set[str]) -> float:
+    searchable = " ".join([
+        entry.get("title", ""),
+        " ".join(entry.get("tags", [])),
+        entry.get("problem_type", ""),
+        entry.get("module", ""),
+        entry.get("category", ""),
+        entry.get("_body", ""),
+    ]).lower()
+    entry_tokens = _tokenize_for_matching(searchable)
+    if not entry_tokens or not objective_tokens:
+        return 0.0
+    overlap = objective_tokens & entry_tokens
+    return len(overlap) / max(len(objective_tokens), 1)
+
+
+def _retrieve_relevant_solutions(objective: str, top_n: int = RAG_TOP_N) -> list[dict]:
+    index = _build_solution_index()
+    if not index:
+        return []
+    obj_tokens = _tokenize_for_matching(objective)
+    if not obj_tokens:
+        return index[:top_n]
+    scored = [(entry, _score_solution(entry, obj_tokens)) for entry in index]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [entry for entry, score in scored[:top_n] if score > 0.0]
+
+
+def _format_rag_context(solutions: list[dict]) -> str:
+    if not solutions:
+        return ""
+    lines = ["[Retrieved prior solutions relevant to this objective]"]
+    for i, entry in enumerate(solutions, 1):
+        title = entry.get("title", os.path.basename(entry.get("_relpath", "unknown")))
+        tags = ", ".join(entry.get("tags", []))
+        source = entry.get("_relpath", "")
+        body = entry.get("_body", "").strip()
+        lines.append(f"\n### Solution {i}: {title}")
+        if tags:
+            lines.append(f"Tags: {tags}")
+        if source:
+            lines.append(f"Source: {source}")
+        if body:
+            lines.append(body)
+    return "\n".join(lines)
+
+
+# ── Hybrid RAG: Index, Chunking, and Persistence ─────────────────────────────
+
+EMBEDDING_CACHE_DIR = os.path.expanduser("~/.omlx/embedding_cache")
+EMBEDDING_DIM = 384
+RAG_ALPHA = float(os.environ.get("RAG_ALPHA", "0.7"))
+
+
+@dataclass
+class DocumentChunk:
+    text: str
+    path: str
+    chunk_id: str
+    section_title: str
+    source_meta: dict
+
+
+@dataclass
+class RetrievedEntry:
+    path: str
+    chunk_id: str
+    section_title: str
+    score: float
+    bm25_score: float
+    cosine_score: float
+    source_meta: dict
+    text: str
+
+
+def _init_embedding_cache() -> None:
+    os.makedirs(os.path.dirname(SEARCH_CACHE_PATH), exist_ok=True)
+    conn = sqlite3.connect(SEARCH_CACHE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+            chunk_id TEXT PRIMARY KEY,
+            doc_path TEXT NOT NULL,
+            doc_mtime REAL NOT NULL,
+            section_title TEXT,
+            chunk_text TEXT,
+            embedding_blob BLOB
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_emb_doc_path ON embedding_cache(doc_path)")
+    conn.commit()
+    conn.close()
+
+
+def _get_cached_embeddings(doc_path: str, current_mtime: float) -> dict[str, list[float]] | None:
+    try:
+        conn = sqlite3.connect(SEARCH_CACHE_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chunk_id, doc_mtime, embedding_blob FROM embedding_cache WHERE doc_path = ?",
+            (doc_path,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return None
+        if any(abs(row["doc_mtime"] - current_mtime) > 0.01 for row in rows):
+            return None
+        result = {}
+        for row in rows:
+            blob = row["embedding_blob"]
+            if blob:
+                import struct
+                n_floats = len(blob) // 4
+                result[row["chunk_id"]] = list(struct.unpack(f"{n_floats}f", blob))
+        return result if result else None
+    except Exception:
+        return None
+
+
+def _store_cached_embeddings(
+    doc_path: str, doc_mtime: float, chunks: list[DocumentChunk], embeddings: dict[str, list[float]]
+) -> None:
+    try:
+        import struct
+        conn = sqlite3.connect(SEARCH_CACHE_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM embedding_cache WHERE doc_path = ?", (doc_path,))
+        for chunk in chunks:
+            emb = embeddings.get(chunk.chunk_id)
+            blob = struct.pack(f"{len(emb)}f", *emb) if emb else None
+            cursor.execute(
+                "INSERT OR REPLACE INTO embedding_cache (chunk_id, doc_path, doc_mtime, section_title, chunk_text, embedding_blob) VALUES (?, ?, ?, ?, ?, ?)",
+                (chunk.chunk_id, doc_path, doc_mtime, chunk.section_title, chunk.text, blob),
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _chunk_markdown(text: str, path: str, source_meta: dict) -> list[DocumentChunk]:
+    if not text.strip():
+        return []
+    chunks = []
+    sections = re.split(r"(?=^## )", text, flags=re.MULTILINE)
+    has_h2_splits = len(sections) > 1 or (sections and sections[0].strip().startswith("## "))
+    if has_h2_splits:
+        for i, section in enumerate(sections):
+            section = section.strip()
+            if not section:
+                continue
+            title_match = re.match(r"^#{1,3}\s+(.+)", section)
+            section_title = title_match.group(1).strip() if title_match else f"preamble"
+            chunk_id = f"{os.path.basename(path)}::{section_title}".replace(" ", "-").lower()
+            chunks.append(DocumentChunk(
+                text=section,
+                path=path,
+                chunk_id=chunk_id,
+                section_title=section_title,
+                source_meta=source_meta,
+            ))
+    if not chunks:
+        title_match = re.match(r"^#\s+(.+)", text.strip())
+        section_title = title_match.group(1).strip() if title_match else "(full document)"
+        chunks.append(DocumentChunk(
+            text=text.strip(),
+            path=path,
+            chunk_id=f"{os.path.basename(path)}::full",
+            section_title=section_title,
+            source_meta=source_meta,
+        ))
+    return chunks
+
+
+def _stream_solutions_for_index(base_dir: str = None) -> list[DocumentChunk]:
+    all_chunks = []
+    solutions_path = os.path.join(base_dir or WORK_DIR, SOLUTIONS_DIR)
+    if os.path.isdir(solutions_path):
+        for root, _dirs, files in os.walk(solutions_path):
+            for fname in sorted(files):
+                if not fname.endswith(".md"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r") as f:
+                        text = f.read()
+                except Exception:
+                    continue
+                meta = {}
+                if text.startswith("---"):
+                    end = text.find("---", 3)
+                    if end != -1:
+                        fm_block = text[3:end].strip()
+                        text = text[end + 3:].strip()
+                        for line in fm_block.splitlines():
+                            if ":" in line:
+                                key, _, val = line.partition(":")
+                                key = key.strip().lstrip("- ")
+                                val = val.strip().strip('"').strip("'")
+                                if key == "tags":
+                                    continue
+                                if key and val:
+                                    meta[key] = val
+                            elif line.strip().startswith("- "):
+                                meta.setdefault("tags", []).append(line.strip().lstrip("- ").strip())
+                rel = os.path.relpath(fpath, base_dir or WORK_DIR)
+                meta["_relpath"] = rel
+                all_chunks.extend(_chunk_markdown(text, fpath, meta))
+
+    learnings_path = os.path.join(base_dir or WORK_DIR, LEARNINGS_FILE)
+    if os.path.isfile(learnings_path):
+        try:
+            with open(learnings_path, "r") as f:
+                content = f.read()
+        except Exception:
+            content = ""
+        if content.strip():
+            entries = re.split(r"\n---\s*\n", content)
+            for entry in entries:
+                entry = entry.strip()
+                if not entry or entry.startswith("# "):
+                    continue
+                title_match = re.search(r"^##\s+(.+)", entry, re.MULTILINE)
+                title = title_match.group(1).strip() if title_match else "untitled-learning"
+                chunk_id = f"learnings::{title}".replace(" ", "-").lower()
+                tags_match = re.search(r"\*\*Tags:\*\*\s*(.+)", entry)
+                meta = {
+                    "_relpath": LEARNINGS_FILE,
+                    "_source": "learnings",
+                }
+                if tags_match:
+                    meta["tags"] = [t.strip() for t in tags_match.group(1).split(",")]
+                if title_match:
+                    meta["title"] = title
+                all_chunks.append(DocumentChunk(
+                    text=entry,
+                    path=learnings_path,
+                    chunk_id=chunk_id,
+                    section_title=title,
+                    source_meta=meta,
+                ))
+    return all_chunks
+
+
+class HybridIndex:
+    def __init__(self):
+        self.chunks: list[DocumentChunk] = []
+        self.embeddings: dict[str, list[float]] = {}
+        self._bm25_doc_freqs: dict[str, int] = {}
+        self._bm25_term_freqs: dict[str, dict[str, int]] = {}
+        self._bm25_doc_lens: dict[str, int] = {}
+        self._bm25_avg_dl: float = 0.0
+        self._built = False
+
+    def add_chunk(self, chunk: DocumentChunk) -> None:
+        self.chunks.append(chunk)
+
+    def batch_build(self, base_dir: str = None) -> dict:
+        _init_embedding_cache()
+        self.chunks = _stream_solutions_for_index(base_dir)
+        self._build_bm25()
+        self._built = True
+        return {c.chunk_id: c for c in self.chunks}
+
+    def _build_bm25(self) -> None:
+        self._bm25_doc_freqs = {}
+        self._bm25_term_freqs = {}
+        self._bm25_doc_lens = {}
+        total_len = 0
+        for chunk in self.chunks:
+            tokens = _rag_tokenize(chunk.text)
+            freq: dict[str, int] = {}
+            for t in tokens:
+                freq[t] = freq.get(t, 0) + 1
+            self._bm25_term_freqs[chunk.chunk_id] = freq
+            self._bm25_doc_lens[chunk.chunk_id] = len(tokens)
+            total_len += len(tokens)
+            for term in set(tokens):
+                self._bm25_doc_freqs[term] = self._bm25_doc_freqs.get(term, 0) + 1
+        n = len(self.chunks)
+        self._bm25_avg_dl = total_len / n if n else 1.0
+
+    @property
+    def is_built(self) -> bool:
+        return self._built
+
+
+def _rag_tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-zA-Z][a-zA-Z0-9_-]*", text.lower())
+
 
 # ── Proactive Context Management (U1) ────────────────────────────────────────
 # Per-layer prompt-token monitoring with a checkpoint trigger that fires before
@@ -2544,6 +2927,17 @@ Return JSON only with this schema:
 - `doc_review` (when used) must come after `deepen_plan` and before `work`.
 - When deciding between `brainstorm` and `plan`, choose `brainstorm` if user-facing behavior or scope is still unclear. Otherwise choose `plan`.
 - Output valid JSON only. No markdown fences or commentary outside the JSON object.
+
+## Prior solutions (RAG context)
+
+Before each decision, you may receive a "[Retrieved prior solutions]" block containing solutions from docs/solutions/ and .compound-engineering/learnings.md that are relevant to the current objective. Use these to:
+
+- **Skip phases already solved.** If a prior solution fully addresses the objective's approach, skip `brainstorm` and go straight to `plan` — reference the solution path in your phase_input so the planner can build on it.
+- **Inform phase_input.** When a retrieved solution contains gotchas, architectural decisions, or patterns relevant to the current phase, include the key insight in phase_input so the specialist phase benefits from it.
+- **Avoid repeating mistakes.** If a solution documents "What Didn't Work", make sure phase_input steers the specialist away from those approaches.
+- **Reference, don't duplicate.** Pass the solution file path (e.g. "See docs/solutions/logic-errors/foo.md") rather than copying the full content into phase_input.
+
+If no solutions are retrieved or none are relevant, proceed normally — the RAG context is advisory, not mandatory.
 """
 
 
@@ -6946,22 +7340,26 @@ class AgentTUI:
         return True
 
     def _start_managed_flow(self, objective: str):
+        rag_solutions = _retrieve_relevant_solutions(objective)
+        rag_context = _format_rag_context(rag_solutions)
+        initial_content = (
+            f"User request:\n{objective}\n\n"
+            f"Current workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+        )
+        if rag_context:
+            initial_content += f"{rag_context}\n\n"
+        initial_content += "Start orchestrating the Compound Engineering flow."
         self.workflow_state = CEWorkflowState(
             active=True,
             objective=objective,
             manager_messages=[
                 {"role": "system", "content": MANAGER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"User request:\n{objective}\n\n"
-                        f"Current workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
-                        "Start orchestrating the Compound Engineering flow."
-                    ),
-                },
+                {"role": "user", "content": initial_content},
             ],
         )
         self.active_ce_mode = "flow"
+        if rag_solutions:
+            self.add_output(f"[RAG] Retrieved {len(rag_solutions)} prior solution(s) for manager context", C_YELLOW)
         self.add_output("--- Entering FLOW mode ---", C_MAGENTA)
         self._run_managed_flow_async()
 
@@ -7151,14 +7549,20 @@ class AgentTUI:
                 self.workflow_state.completed_phases.append(phase)
             self.workflow_state.awaiting_user = False
             self.workflow_state.pending_question = ""
+            phase_msg = (
+                f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
+                f"Completed phases: {', '.join(self.workflow_state.completed_phases)}\n"
+                f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                f"Phase result:\n{result[:4000]}"
+            )
+            rag_refresh = _format_rag_context(_retrieve_relevant_solutions(
+                f"{self.workflow_state.objective} {result[:500]}"
+            ))
+            if rag_refresh:
+                phase_msg += f"\n\n{rag_refresh}"
             self.workflow_state.manager_messages.append({
                 "role": "user",
-                "content": (
-                    f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
-                    f"Completed phases: {', '.join(self.workflow_state.completed_phases)}\n"
-                    f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
-                    f"Phase result:\n{result[:4000]}"
-                ),
+                "content": phase_msg,
             })
 
         self.active_ce_mode = None
@@ -7965,22 +8369,26 @@ def _main_plain(model_config, messages, models):
         elif user_input == "/ce:flow" or user_input.startswith("/ce:flow "):
             _begin_user_chat_turn(WORK_DIR)
             objective = user_input[len("/ce:flow "):].strip() if user_input.startswith("/ce:flow ") else "Drive the full Compound Engineering workflow for the current task."
+            rag_solutions = _retrieve_relevant_solutions(objective)
+            rag_context = _format_rag_context(rag_solutions)
+            initial_content = (
+                f"User request:\n{objective}\n\n"
+                f"Current workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+            )
+            if rag_context:
+                initial_content += f"{rag_context}\n\n"
+            initial_content += "Start orchestrating the Compound Engineering flow."
             workflow_state = CEWorkflowState(
                 active=True,
                 objective=objective,
                 manager_messages=[
                     {"role": "system", "content": MANAGER_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"User request:\n{objective}\n\n"
-                            f"Current workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
-                            "Start orchestrating the Compound Engineering flow."
-                        ),
-                    },
+                    {"role": "user", "content": initial_content},
                 ],
             )
             active_ce_mode = "flow"
+            if rag_solutions:
+                print(f"\n\033[1;33m[RAG] Retrieved {len(rag_solutions)} prior solution(s) for manager context\033[0m")
             print("\n\033[1;35m--- Entering FLOW mode ---\033[0m")
             iterations = 0
             while workflow_state.active:
@@ -8042,14 +8450,20 @@ def _main_plain(model_config, messages, models):
                     workflow_state.completed_phases.append(phase)
                 workflow_state.awaiting_user = False
                 workflow_state.pending_question = ""
+                phase_msg = (
+                    f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
+                    f"Completed phases: {', '.join(workflow_state.completed_phases)}\n"
+                    f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                    f"Phase result:\n{result[:4000]}"
+                )
+                rag_refresh = _format_rag_context(_retrieve_relevant_solutions(
+                    f"{workflow_state.objective} {result[:500]}"
+                ))
+                if rag_refresh:
+                    phase_msg += f"\n\n{rag_refresh}"
                 workflow_state.manager_messages.append({
                     "role": "user",
-                    "content": (
-                        f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
-                        f"Completed phases: {', '.join(workflow_state.completed_phases)}\n"
-                        f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
-                        f"Phase result:\n{result[:4000]}"
-                    ),
+                    "content": phase_msg,
                 })
             continue
         elif user_input == "/ce:learnings":
@@ -8127,14 +8541,20 @@ def _main_plain(model_config, messages, models):
                     workflow_state.completed_phases.append(phase)
                 workflow_state.awaiting_user = False
                 workflow_state.pending_question = ""
+                phase_msg = (
+                    f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
+                    f"Completed phases: {', '.join(workflow_state.completed_phases)}\n"
+                    f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
+                    f"Phase result:\n{result[:4000]}"
+                )
+                rag_refresh = _format_rag_context(_retrieve_relevant_solutions(
+                    f"{workflow_state.objective} {result[:500]}"
+                ))
+                if rag_refresh:
+                    phase_msg += f"\n\n{rag_refresh}"
                 workflow_state.manager_messages.append({
                     "role": "user",
-                    "content": (
-                        f"Phase {'completed' if phase_succeeded else 'failed'}: {phase}\n"
-                        f"Completed phases: {', '.join(workflow_state.completed_phases)}\n"
-                        f"Workflow artifacts:\n{_format_workflow_artifacts()}\n\n"
-                        f"Phase result:\n{result[:4000]}"
-                    ),
+                    "content": phase_msg,
                 })
             continue
 
