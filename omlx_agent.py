@@ -170,7 +170,7 @@ def _chunk_markdown(text: str, path: str, source_meta: dict) -> list[DocumentChu
     return chunks
 
 
-def _stream_solutions_for_index(base_dir: str = None) -> list[DocumentChunk]:
+def _stream_solutions_for_index(base_dir: str | None = None) -> list[DocumentChunk]:
     all_chunks = []
     solutions_path = os.path.join(base_dir or WORK_DIR, SOLUTIONS_DIR)
     if os.path.isdir(solutions_path):
@@ -253,12 +253,11 @@ class HybridIndex:
     def add_chunk(self, chunk: DocumentChunk) -> None:
         self.chunks.append(chunk)
 
-    def batch_build(self, base_dir: str = None) -> dict:
+    def batch_build(self, base_dir: str | None = None) -> None:
         _init_embedding_cache()
         self.chunks = _stream_solutions_for_index(base_dir)
         self._build_bm25()
         self._built = True
-        return {c.chunk_id: c for c in self.chunks}
 
     def _build_bm25(self) -> None:
         self._bm25_doc_freqs = {}
@@ -278,7 +277,7 @@ class HybridIndex:
         n = len(self.chunks)
         self._bm25_avg_dl = total_len / n if n else 1.0
 
-    def bm25_retrieve(self, query: str, top_k: int = 5) -> list:
+    def bm25_retrieve(self, query: str, top_k: int = 5) -> list[RetrievedEntry]:
         if not self._built or not self.chunks:
             return []
         query_tokens = _rag_tokenize(query)
@@ -325,7 +324,7 @@ class HybridIndex:
             ))
         return results
 
-    def hybrid_retrieve(self, query: str, top_k: int = 5) -> list:
+    def hybrid_retrieve(self, query: str, top_k: int = 5) -> list[RetrievedEntry]:
         if not self._built or not self.chunks:
             return []
         bm25_results = self.bm25_retrieve(query, top_k=top_k * 2)
@@ -416,15 +415,18 @@ def _get_hybrid_index() -> HybridIndex:
     return _hybrid_index
 
 
-def _retrieve_relevant_solutions(objective: str, top_n: int = 5) -> list:
+def _retrieve_relevant_solutions(objective: str, top_n: int = 5) -> list[RetrievedEntry]:
     try:
         idx = _get_hybrid_index()
         return idx.hybrid_retrieve(objective, top_k=top_n)
-    except Exception:
+    except Exception as exc:
+        import traceback
+        sys.stderr.write(f"[RAG] retrieval failed: {exc}\n")
+        traceback.print_exc(file=sys.stderr)
         return []
 
 
-def _format_rag_context(solutions: list) -> str:
+def _format_rag_context(solutions: list[RetrievedEntry]) -> str:
     if not solutions:
         return ""
     lines = ["[Retrieved prior solutions relevant to this objective]"]
@@ -460,10 +462,43 @@ try:
 except ImportError:
     pass
 
-_ONNX_MODEL_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_qint8_arm64.onnx"
-_TOKENIZER_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+_ONNX_MODEL_COMMIT = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+_ONNX_MODEL_URL = f"https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/{_ONNX_MODEL_COMMIT}/onnx/model_qint8_arm64.onnx"
+_TOKENIZER_URL = f"https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/{_ONNX_MODEL_COMMIT}/tokenizer.json"
+_ONNX_MODEL_SHA256 = "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474"
+_TOKENIZER_SHA256 = "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"
 _embedding_session = None
 _embedding_tokenizer = None
+
+
+def _verify_file_sha256(path: str, expected_hash: str) -> bool:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest() == expected_hash
+
+
+def _download_verified(url: str, dest_path: str, expected_hash: str, timeout: int = 120) -> None:
+    tmp_path = dest_path + ".tmp"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": REALISTIC_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if not _verify_file_sha256(tmp_path, expected_hash):
+            raise ValueError(f"SHA-256 mismatch for {os.path.basename(dest_path)}")
+        os.replace(tmp_path, dest_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def _ensure_embedding_model() -> bool:
@@ -472,24 +507,14 @@ def _ensure_embedding_model() -> bool:
         return True
     if not _ONNX_AVAILABLE:
         return False
-    os.makedirs(EMBEDDING_CACHE_DIR, exist_ok=True)
+    os.makedirs(EMBEDDING_CACHE_DIR, mode=0o700, exist_ok=True)
     model_path = os.path.join(EMBEDDING_CACHE_DIR, "model_qint8_arm64.onnx")
     tokenizer_path = os.path.join(EMBEDDING_CACHE_DIR, "tokenizer.json")
     try:
-        if not os.path.isfile(model_path):
-            req = urllib.request.Request(_ONNX_MODEL_URL, headers={"User-Agent": REALISTIC_USER_AGENT})
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                with open(model_path, "wb") as f:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-        if not os.path.isfile(tokenizer_path):
-            req = urllib.request.Request(_TOKENIZER_URL, headers={"User-Agent": REALISTIC_USER_AGENT})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                with open(tokenizer_path, "wb") as f:
-                    f.write(resp.read())
+        if not os.path.isfile(model_path) or not _verify_file_sha256(model_path, _ONNX_MODEL_SHA256):
+            _download_verified(_ONNX_MODEL_URL, model_path, _ONNX_MODEL_SHA256, timeout=120)
+        if not os.path.isfile(tokenizer_path) or not _verify_file_sha256(tokenizer_path, _TOKENIZER_SHA256):
+            _download_verified(_TOKENIZER_URL, tokenizer_path, _TOKENIZER_SHA256, timeout=30)
         _embedding_session = onnxruntime.InferenceSession(
             model_path, providers=["CPUExecutionProvider"]
         )
@@ -500,6 +525,12 @@ def _ensure_embedding_model() -> bool:
     except Exception:
         _embedding_session = None
         _embedding_tokenizer = None
+        for p in (model_path, tokenizer_path):
+            try:
+                if os.path.isfile(p) and not _verify_file_sha256(p, _ONNX_MODEL_SHA256 if "model" in p else _TOKENIZER_SHA256):
+                    os.remove(p)
+            except OSError:
+                pass
         return False
 
 

@@ -94,11 +94,10 @@ class StreamSolutionsTests(unittest.TestCase):
 
 
 class HybridIndexTests(unittest.TestCase):
-    def test_batch_build_returns_dict(self):
+    def test_batch_build_populates_chunks(self):
         idx = omlx_agent.HybridIndex()
-        result = idx.batch_build(_REPO_ROOT)
-        self.assertIsInstance(result, dict)
-        self.assertGreater(len(result), 0)
+        idx.batch_build(_REPO_ROOT)
+        self.assertGreater(len(idx.chunks), 0)
 
     def test_is_built_flag(self):
         idx = omlx_agent.HybridIndex()
@@ -115,8 +114,8 @@ class HybridIndexTests(unittest.TestCase):
     def test_empty_build(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             idx = omlx_agent.HybridIndex()
-            result = idx.batch_build(tmpdir)
-            self.assertEqual(len(result), 0)
+            idx.batch_build(tmpdir)
+            self.assertEqual(len(idx.chunks), 0)
             self.assertTrue(idx.is_built)
 
 
